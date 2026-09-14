@@ -1,0 +1,544 @@
+---
+title: "End-to-End CI/CD Pipeline: Jenkins to ArgoCD on AWS"
+sidebarTitle: "Pipeline Overview"
+description: "End-to-end CI/CD pipeline: Jenkins, Maven, JUnit, SonarQube, Docker, Trivy, AWS ECR, ArgoCD GitOps deployment, and Prometheus monitoring on Kubernetes."
+---
+
+A mature CI/CD pipeline is far more than a script that builds and deploys code. It is a repeatable, traceable, and observable software delivery system with quality gates, security scanning, immutable artifacts, and automated rollback capability. This page documents the complete end-to-end pipeline used for containerized Java applications on AWS — from a developer's `git push` all the way through GitOps-based deployment to Kubernetes, post-deployment validation, and Prometheus alerting. Each stage is explained with its purpose, commands, and the failure condition that stops the pipeline from proceeding.
+
+---
+
+## CI vs. CD Stages at a Glance
+
+<CardGroup cols={2}>
+  <Card title="Continuous Integration (CI)" icon="wrench">
+    **GitHub → Jenkins → Maven → JUnit → SonarQube → Docker → Trivy → ECR**
+
+    The CI half validates code quality, runs tests, enforces security, and produces an immutable versioned container image. If any gate fails, the pipeline stops before an artifact is created.
+  </Card>
+  <Card title="Continuous Delivery (CD)" icon="rocket">
+    **ECR → GitOps Repo → Argo CD → Kubernetes → Validation → Prometheus → Alertmanager**
+
+    The CD half takes the verified artifact and deploys it using a GitOps model. Git is the source of truth for desired cluster state, and Argo CD continuously reconciles the cluster toward that state.
+  </Card>
+</CardGroup>
+
+---
+
+## Full Pipeline Flow
+
+```text title="End-to-end pipeline"
+Developer
+   ↓
+GitHub
+   ↓
+Jenkins
+   ↓
+Maven Build
+   ↓
+JUnit Tests
+   ↓
+SonarQube
+   ↓
+Docker Build
+   ↓
+Trivy Security Scan
+   ↓
+Amazon ECR
+   ↓
+GitOps Repository
+   ↓
+Argo CD
+   ↓
+Kubernetes Deployment
+   ↓
+Post-Deployment Validation
+   ↓
+Prometheus
+   ↓
+Alertmanager
+   ↓
+Logging / Observability
+```
+
+---
+
+## Stage-by-Stage Explanation
+
+<Steps>
+  <Step title="GitHub — Source Control and Webhook Trigger">
+    The developer stores application source code in a Git repository on GitHub. A typical repository structure includes:
+
+    ```text title="Example repository structure"
+    my-application/
+    ├── src/
+    ├── pom.xml
+    ├── Dockerfile
+    ├── k8s/
+    │   ├── deployment.yaml
+    │   └── service.yaml
+    └── README.md
+    ```
+
+    When a developer pushes code, that push becomes the pipeline trigger:
+
+    ```bash title="Developer pushes a feature"
+    git add .
+    git commit -m "Add new payment feature"
+    git push origin main
+    ```
+
+    ```text title="Trigger chain"
+    Developer pushes code
+            ↓
+    GitHub webhook fires
+            ↓
+    Jenkins pipeline starts
+    ```
+
+    GitHub provides version control, branching, pull requests, code review, change history, and rollback capability — all before a single line is compiled.
+  </Step>
+
+  <Step title="Jenkins — CI Server and Pipeline Orchestration">
+    Jenkins acts as the CI/CD automation server. Once it receives the GitHub webhook, it checks out the exact source-code version that triggered the build:
+
+    ```bash title="Jenkins checks out the triggering commit"
+    git clone <repository>
+    git checkout <commit-or-branch>
+    ```
+
+    Checking out the exact commit (rather than just `main`) makes the build reproducible, traceable, and auditable:
+
+    ```text title="Commit-to-build traceability"
+    Git commit: a82f91c
+           ↓
+    Jenkins build #152
+           ↓
+    Docker image built from a82f91c
+    ```
+
+    Jenkins then runs the subsequent pipeline stages in sequence, failing fast if any stage does not pass its gate.
+  </Step>
+
+  <Step title="Maven — Java Build and Dependency Resolution">
+    Apache Maven builds the Java application using the `pom.xml` descriptor at the project root.
+
+    ```bash title="Standard Maven build command"
+    mvn clean package
+    ```
+
+    Maven performs these tasks in order:
+
+    - Cleans previous build artifacts
+    - Resolves and downloads dependencies
+    - Compiles source code
+    - Runs configured build phases
+    - Packages the application
+
+    A successful build produces a deployable artifact, for example:
+
+    ```text title="Maven build output"
+    target/application.jar
+    ```
+
+    ```text title="Maven build flow"
+    Java source code
+           ↓
+    Maven
+           ↓
+    Compiled classes
+           ↓
+    JAR/WAR artifact
+    ```
+  </Step>
+
+  <Step title="JUnit — Automated Unit Testing">
+    After the build, JUnit executes automated unit tests to validate individual application components. Maven runs these as part of the test phase:
+
+    ```bash title="Run unit tests"
+    mvn test
+    ```
+
+    A sample test:
+
+    ```java title="Example JUnit test"
+    @Test
+    void shouldCalculateOrderTotal() {
+        assertEquals(100, orderService.calculateTotal(...));
+    }
+    ```
+
+    The pipeline enforces a hard gate on test results:
+
+    ```text title="Test gate logic"
+    JUnit → PASS  →  Continue pipeline
+    JUnit → FAIL  →  Pipeline stops, developer investigates
+    ```
+
+    <Note>
+    The fundamental CI principle: **do not deploy code that has failed automated tests.** A failed test in CI is cheaper to fix than a production incident.
+    </Note>
+  </Step>
+
+  <Step title="SonarQube — Static Code Analysis and Quality Gate">
+    SonarQube analyzes source code for bugs, code smells, security vulnerabilities, duplicated code, and test coverage gaps. The pipeline triggers analysis via Maven:
+
+    ```bash title="Run SonarQube analysis"
+    mvn sonar:sonar
+    ```
+
+    The organization configures a **Quality Gate** — a pass/fail threshold for the analysis results:
+
+    ```text title="Quality Gate logic"
+    SonarQube Analysis
+            ↓
+    Quality Gate
+        ↙       ↘
+     PASS       FAIL
+      ↓           ↓
+    Continue   Pipeline stops
+    ```
+
+    This prevents poorly tested or vulnerable code from progressing to the Docker build stage. SonarQube can identify bugs, security issues, duplicated code, and maintainability problems in a single analysis pass.
+  </Step>
+
+  <Step title="Docker — Build the Container Image">
+    Once the application has passed all CI quality gates, Jenkins builds a Docker container image. A conceptual Dockerfile for a Java application:
+
+    ```dockerfile title="Example Dockerfile"
+    FROM eclipse-temurin:17-jre
+
+    COPY target/application.jar /app/application.jar
+
+    ENTRYPOINT ["java", "-jar", "/app/application.jar"]
+    ```
+
+    The pipeline builds the image and tags it with the Jenkins build number for traceability:
+
+    ```bash title="Build and tag the Docker image"
+    docker build -t myapp:${BUILD_NUMBER} .
+    ```
+
+    This produces an immutable, versioned artifact:
+
+    ```text title="Tagged image"
+    myapp:152
+    ```
+
+    Containers provide consistent runtime environments, portability, isolation, and versioned application artifacts — ensuring the image that passed testing is identical to what gets deployed.
+  </Step>
+
+  <Step title="Trivy — Container Security Scanning">
+    Before pushing the image to the registry, the pipeline scans it for known vulnerabilities using Trivy:
+
+    ```bash title="Scan the container image"
+    trivy image myapp:${BUILD_NUMBER}
+    ```
+
+    Trivy can identify vulnerabilities in OS packages, application dependencies, container image layers, and misconfigurations.
+
+    ```text title="Trivy security gate"
+    Docker Image
+         ↓
+       Trivy
+         ↓
+    Vulnerability Scan
+         ↓
+     ┌───────────────┐
+     │               │
+    PASS            FAIL
+     │               │
+     ↓               ↓
+    Continue       Stop pipeline
+    ```
+
+    Depending on organizational policy, the pipeline can fail on critical or high-severity findings, preventing vulnerable images from reaching the registry.
+  </Step>
+
+  <Step title="Amazon ECR — Push Versioned Image to Registry">
+    After passing the security scan, the image is pushed to **Amazon Elastic Container Registry (ECR)**:
+
+    ```text title="ECR image reference"
+    123456789012.dkr.ecr.ap-south-1.amazonaws.com/myapp:152
+    ```
+
+    Image tagging strategy is important. Avoid relying solely on `latest`:
+
+    ```text title="Preferred tagging strategies"
+    myapp:152          ← build number
+    myapp:a82f91c      ← git SHA (most traceable)
+    ```
+
+    A versioned tag tied to a specific commit or build number provides full traceability from deployed container back to the source code that produced it.
+  </Step>
+
+  <Step title="GitOps Repository — Update the Desired State">
+    This is the architectural boundary between CI and CD. Instead of Jenkins deploying directly to Kubernetes, the pipeline updates a **GitOps repository** that holds Kubernetes manifests.
+
+    Before the update, a Kubernetes manifest might contain:
+
+    ```yaml title="Manifest before update"
+    image:
+      repository: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/myapp
+      tag: "151"
+    ```
+
+    After a successful build, Jenkins updates the tag:
+
+    ```yaml title="Manifest after update"
+    image:
+      repository: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/myapp
+      tag: "152"
+    ```
+
+    Then commits and pushes:
+
+    ```bash title="Commit the manifest change"
+    git add .
+    git commit -m "Update application image to 152"
+    git push
+    ```
+
+    Git now becomes the desired-state source of truth for the deployment. This gives teams version-controlled deployment history, easy rollback, and clear separation between CI and CD responsibilities.
+  </Step>
+
+  <Step title="Argo CD — GitOps Deployment to Kubernetes">
+    Argo CD continuously watches the GitOps repository. When it detects that the desired state in Git differs from the actual state in the cluster, it reconciles the difference:
+
+    ```text title="Argo CD reconciliation"
+    Git contains:       myapp:152
+    Cluster running:    myapp:151
+            ↓
+    Argo CD detects drift
+            ↓
+    Synchronizes cluster → desired state
+    ```
+
+    The GitOps model:
+
+    ```text title="GitOps deployment flow"
+            Git
+             │
+             │ Desired State
+             ▼
+          Argo CD
+             │
+             ▼
+        Kubernetes
+             │
+             ▼
+       Running Application
+    ```
+
+    This differs fundamentally from a pipeline that runs `kubectl apply` directly. With GitOps, every deployment is recorded in Git, providing auditability, rollback capability, and declarative infrastructure state.
+  </Step>
+
+  <Step title="Post-Deployment Validation">
+    A successful deployment command does **not** mean the application is functioning correctly. The pipeline and operations team must verify real application health:
+
+    ```bash title="Check pod status"
+    kubectl get pods
+    ```
+
+    ```bash title="Check services"
+    kubectl get svc
+    ```
+
+    ```bash title="Check deployment rollout"
+    kubectl get deployment
+    ```
+
+    ```bash title="Inspect pod details"
+    kubectl describe pod <pod-name>
+    ```
+
+    ```bash title="Check application logs"
+    kubectl logs <pod-name>
+    ```
+
+    For applications with a health endpoint:
+
+    ```text title="Health check"
+    GET /health  →  Expected: HTTP 200 OK
+    ```
+
+    A mature pipeline validates the full chain:
+
+    ```text title="Post-deployment validation chain"
+    Deployment
+        ↓
+    Pod Ready?
+        ↓
+    Application Healthy?
+        ↓
+    Health Endpoint OK?
+        ↓
+    Traffic Working?
+    ```
+  </Step>
+
+  <Step title="Prometheus — Metrics Collection and Monitoring">
+    Prometheus collects and stores time-series metrics by scraping the `/metrics` endpoint exposed by the application and cluster components:
+
+    ```text title="Example Prometheus metrics"
+    http_requests_total
+    http_request_duration_seconds
+    process_cpu_seconds_total
+    ```
+
+    Typical metrics monitored include CPU utilization, memory utilization, request count, request latency, error rate, pod availability, and HTTP status codes.
+
+    ```text title="Prometheus scrape model"
+    Application
+         ↓
+     /metrics
+         ↓
+    Prometheus
+         ↓
+    Time-series metrics
+    ```
+  </Step>
+
+  <Step title="Alertmanager — Alerts and Notifications">
+    Prometheus evaluates alerting rules and routes fired alerts through Alertmanager, which handles grouping, deduplication, routing, and delivery:
+
+    ```text title="Alert delivery chain"
+    HTTP 5xx rate > threshold
+              ↓
+           Alert fires
+              ↓
+         Alertmanager
+              ↓
+       On-call engineer
+    ```
+
+    Alertmanager can deliver notifications to email, Slack, PagerDuty, and other incident-management systems.
+  </Step>
+
+  <Step title="Logging and Observability">
+    Metrics alone do not tell the complete story of a production system. A full observability stack combines metrics, logs, and traces:
+
+    ```text title="Observability pillars"
+    Metrics
+       +
+    Logs
+       +
+    Traces
+       ↓
+    Observability
+    ```
+
+    Common tools in this layer include Grafana, Loki, Elasticsearch, OpenSearch, Fluent Bit, Fluentd, OpenTelemetry, and Jaeger — the exact combination depends on the organization's architecture.
+  </Step>
+</Steps>
+
+---
+
+## Why GitOps Instead of Direct Deployment?
+
+A traditional pipeline deploys directly from the CI server:
+
+```text title="Traditional CI/CD approach"
+Jenkins  →  kubectl apply  →  Kubernetes
+```
+
+The GitOps approach used here routes through a versioned repository:
+
+```text title="GitOps approach"
+Jenkins  →  Update Git  →  GitOps Repo  →  Argo CD  →  Kubernetes
+```
+
+The key advantage: **Git becomes the single source of truth for the desired deployment state**, giving teams audit history, rollback capability, declarative deployments, and a clear separation of responsibilities between the CI server and the deployment operator.
+
+---
+
+## Production Improvements
+
+<Accordion title="Immutable Image Tags">
+Always tag images with a Git SHA or build number rather than `latest`:
+
+```text
+myapp:<git-sha>   ← preferred
+myapp:latest      ← avoid for production
+```
+
+Immutable tags ensure you can always trace a running container back to the exact source commit that produced it.
+</Accordion>
+
+<Accordion title="Deployment Strategies">
+Instead of sending 100% of traffic to a new release immediately, consider progressive strategies:
+
+```text title="Canary deployment example"
+Version 1 → 90% traffic
+Version 2 → 10% traffic
+
+If Version 2 is healthy:
+Version 1 → 0%
+Version 2 → 100%
+```
+
+Rolling, blue/green, and canary deployments all reduce the blast radius of a bad release.
+</Accordion>
+
+<Accordion title="Automatic Rollback">
+If post-deployment health checks fail, an automated rollback returns traffic to the last known-good version:
+
+```text title="Automatic rollback flow"
+Deployment
+    ↓
+Health check fails
+    ↓
+Rollback
+    ↓
+Previous stable version
+```
+</Accordion>
+
+<Accordion title="Secrets Management">
+Never store production credentials inside Git, even in a private GitOps repository. Use a dedicated secrets-management solution and inject secrets at runtime.
+</Accordion>
+
+---
+
+## Example End-to-End Scenario
+
+A developer modifies `PaymentService.java` and pushes to `main`. Here is what happens across all 13 pipeline stages:
+
+```bash title="Step 1 — Developer push"
+git push origin main
+```
+
+```bash title="Step 3 — Maven build"
+mvn clean package
+```
+
+```bash title="Step 4 — Unit tests"
+mvn test
+```
+
+```bash title="Step 6 — Docker build"
+docker build -t myapp:a82f91c .
+```
+
+```bash title="Step 7 — Security scan"
+trivy image myapp:a82f91c
+```
+
+```yaml title="Step 9 — GitOps manifest update"
+image:
+  tag: a82f91c
+```
+
+```bash title="Step 11 — Post-deployment validation"
+kubectl get pods
+```
+
+If Prometheus detects the error rate crossing a threshold after deployment:
+
+```text title="Step 13 — Alert fires"
+Prometheus  →  Alertmanager  →  On-call Engineer
+```
+
+<Tip>
+The one-line interview summary: *"A developer pushes to GitHub; Jenkins checks out the code and runs Maven build, JUnit tests, SonarQube quality checks, Docker build, and Trivy security scan; the validated image is pushed to ECR; Jenkins updates the GitOps repository; Argo CD deploys the desired state to Kubernetes; and Prometheus, Alertmanager, and logging provide post-deployment observability."*
+</Tip>

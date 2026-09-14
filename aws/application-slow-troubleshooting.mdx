@@ -1,0 +1,532 @@
+---
+title: "Diagnosing Slow AWS Applications: Layer-by-Layer Triage"
+sidebarTitle: "Slow App Triage"
+description: "Systematic request-path triage for slow AWS applications — covering Route 53 DNS checks, ALB metrics, EC2 performance commands, database slow queries, and cache hit analysis."
+---
+
+When an application becomes slow in production, the instinct is to immediately restart services or scale up EC2 instances. That instinct is almost always wrong. Slowness is a symptom — the actual bottleneck could be anywhere in the request path, from a DNS misconfiguration to a missing database index to a saturated NAT Gateway. The only reliable approach is to follow the request path from the end user inward, eliminating each layer as the cause before moving to the next. This guide documents that methodology with the specific commands, metrics, and questions that let you isolate the problem quickly.
+
+## The Core Principle
+
+```text
+Don't troubleshoot randomly — isolate the slow layer first.
+```
+
+Every troubleshooting session begins with one question: **where in the request path does latency appear?** Once you know the layer, you can focus. Without that answer, you waste time tuning EC2 instance settings while a missing database index causes five-second full table scans.
+
+The full request path for a typical AWS-hosted application is:
+
+```text
+End Users
+    ↓
+Route 53
+    ↓
+Load Balancer (ALB/NLB)
+    ↓
+EC2 / Web Server
+    ↓
+Database / Cache / S3 / External APIs
+```
+
+At every layer, ask the same set of questions:
+
+- Is this component healthy?
+- Is latency increasing here?
+- Are there errors or connection failures?
+- Is there resource saturation?
+- Is traffic unusually high?
+
+---
+
+## Layer-by-Layer Triage
+
+<Steps>
+  <Step title="Layer 1 — Users and Traffic: Scope the Problem">
+    Before any diagnostics, understand **who is affected and when**. The answers change everything about where you investigate next.
+
+    **Questions to answer first:**
+    - Is the issue affecting all users or only some?
+    - Is it continuous or intermittent?
+    - Did it start after a deployment?
+    - Is one specific API endpoint or page slower than others?
+    - Is the problem region-specific or global?
+    - Is the application slow only during peak traffic hours?
+
+    **Look for traffic anomalies:**
+
+    A sudden traffic spike is one of the most common causes of application-wide slowness, and it is entirely invisible if you only look at the server:
+
+    ```text
+    More Users
+        ↓
+    More Requests
+        ↓
+    More Connections
+        ↓
+    Resource Saturation
+        ↓
+    Higher Latency
+    ```
+
+    Check for sudden traffic spikes, increased concurrent users, unusual request rates, bot traffic, and large concentrations of requests hitting a single endpoint. Access logs and CloudWatch `RequestCount` metrics are your best starting point here.
+
+    <Tip>
+    In an interview, always start your answer here. Saying "I would first determine whether all users are affected or just some, and whether it started after a recent deployment" immediately signals structured thinking over panic-driven guessing.
+    </Tip>
+  </Step>
+
+  <Step title="Layer 2 — DNS and Route 53: Eliminate Early">
+    DNS is rarely the sustained cause of application slowness, but it should be eliminated early — an incorrect health check or routing misconfiguration can send traffic to the wrong target or cause intermittent failures.
+
+    **What to check:**
+    - Is DNS resolution returning the correct record?
+    - Is TTL appropriate, or is stale DNS causing clients to hit wrong targets?
+    - Are Route 53 health checks passing for all registered endpoints?
+    - Is the routing policy (latency, weighted, failover) behaving as expected?
+
+    **Diagnostic commands:**
+
+    ```bash title="Basic DNS lookup"
+    dig example.com
+    ```
+
+    ```bash title="Alternative DNS lookup"
+    nslookup example.com
+    ```
+
+    ```bash title="Measure DNS resolution time"
+    time dig example.com
+    ```
+
+    **Possible problems:**
+    - Incorrect DNS record pointing to a decommissioned IP
+    - Failed health checks removing healthy targets from rotation
+    - Unexpected failover routing traffic to a degraded secondary
+    - High DNS resolution latency adding noticeable delay at the very start of each request
+
+    If DNS resolution is returning the correct IP in under 10–20ms and health checks are green, move to the load balancer.
+  </Step>
+
+  <Step title="Layer 3 — Load Balancer: Check Target Response Time">
+    If the load balancer is serving requests but target response time is high, the bottleneck is inside the application or its dependencies — not the ALB itself. This single metric is one of the most valuable signals in the entire stack.
+
+    **Key CloudWatch metrics for an Application Load Balancer:**
+
+    ```text
+    TargetResponseTime       ← most important for diagnosing slowness
+    RequestCount
+    ActiveConnectionCount
+    HTTPCode_Target_5XX_Count
+    HTTPCode_ELB_5XX_Count
+    HealthyHostCount
+    UnHealthyHostCount
+    ```
+
+    **How to interpret the signal:**
+
+    ```text
+    Client
+      ↓
+    ALB
+      ↓
+    TargetResponseTime = 5 seconds    ← high
+      ↓
+    ALB itself is healthy
+      ↓
+    Problem is inside EC2 / Application
+    ```
+
+    If `TargetResponseTime` is high but ALB metrics (connection counts, error rates) are normal, the load balancer is doing its job — the slowness is downstream. Proceed to the EC2 layer. If `UnHealthyHostCount` is non-zero, investigate why targets are failing health checks.
+  </Step>
+
+  <Step title="Layer 4 — EC2 and Web Server: Investigate the Compute Layer">
+    The EC2 layer has the most variables. Work through CPU, memory, disk, I/O, network, and application logs systematically rather than in random order.
+
+    ---
+
+    ### CPU
+
+    ```bash title="Interactive process viewer"
+    top
+    ```
+
+    ```bash title="Enhanced interactive viewer (if installed)"
+    htop
+    ```
+
+    ```bash title="Sort processes by CPU"
+    ps aux --sort=-%cpu
+    ```
+
+    Look for: high overall CPU utilization, a single process consuming excessive CPU, sudden CPU spikes correlating with the slowness window. Common causes include CPU-intensive application code, infinite loops, too many concurrent requests, or expensive background calculations.
+
+    ---
+
+    ### Memory
+
+    ```bash title="Check memory and swap"
+    free -h
+    ```
+
+    ```bash title="Sort processes by memory"
+    ps aux --sort=-%mem
+    ```
+
+    High memory pressure degrades performance before the system runs out entirely:
+
+    ```text
+    High Memory Usage
+           ↓
+    Memory Pressure
+           ↓
+    Swap / OOM
+           ↓
+    Application Performance Degrades
+    ```
+
+    Check for memory leaks (steadily growing RSS over time), processes consuming unexpected amounts of RAM, and OOM-related kills in the system log.
+
+    ---
+
+    ### System-Wide View
+
+    ```bash title="System performance snapshot (5 samples, 1s interval)"
+    vmstat 1 5
+    ```
+
+    Useful indicators: high CPU wait (signal of I/O bottleneck), high I/O wait, active swapping, and excessive process context switches.
+
+    ---
+
+    ### Disk Space and Inodes
+
+    ```bash title="Check disk space"
+    df -h
+    ```
+
+    ```bash title="Check inode usage"
+    df -i
+    ```
+
+    A server can have available block space but run into problems if it exhausts inodes — common when log rotation fails or applications create thousands of small temporary files. A full disk (`df -h` at 100%) will cause the application to fail writes and can crash web servers and databases.
+
+    ---
+
+    ### Disk I/O
+
+    ```bash title="Disk I/O statistics (5 samples, 1s interval)"
+    iostat -xz 1 5
+    ```
+
+    Check disk utilization percentage, average request latency, read/write throughput, and I/O wait. High disk latency makes an otherwise healthy application appear slow — a common issue with burstable EBS volumes that have exhausted their burst credit balance.
+
+    ---
+
+    ### Network and Connections
+
+    ```bash title="List active connections and listening ports"
+    ss -tulpn
+    ```
+
+    ```bash title="Network interface statistics"
+    netstat -i
+    ```
+
+    Investigate active connection counts, connection backlogs, network errors, and packet loss. Too many connections, connection leaks, or security group rules blocking responses all manifest as hangs from the application's perspective.
+
+    ---
+
+    ### Application and Web Server Logs
+
+    Metrics tell you **that** something is wrong — logs tell you **why**.
+
+    <Tabs>
+      <Tab title="Nginx">
+        ```bash title="Nginx access log (live)"
+        tail -f /var/log/nginx/access.log
+        ```
+
+        ```bash title="Nginx error log (live)"
+        tail -f /var/log/nginx/error.log
+        ```
+      </Tab>
+      <Tab title="Apache">
+        ```bash title="Apache access log (live)"
+        tail -f /var/log/httpd/access_log
+        ```
+
+        ```bash title="Apache error log (live)"
+        tail -f /var/log/httpd/error_log
+        ```
+      </Tab>
+      <Tab title="System / Kernel">
+        ```bash title="Kernel and driver messages"
+        dmesg | tail
+        ```
+
+        Look for OOM events, disk errors, network interface issues, and driver-level failures that metrics dashboards do not surface.
+      </Tab>
+    </Tabs>
+
+    **Search logs for these patterns:** `timeout`, `5xx`, `connection refused`, `connection reset`, `slow query`, `out of memory`, `throttling`.
+  </Step>
+
+  <Step title="Layer 5 — Database, Cache, and External Dependencies">
+    If the EC2 layer looks healthy (CPU, memory, disk, network all normal), the bottleneck is almost always here. A single slow database query can make the entire application appear sluggish to every user.
+
+    ---
+
+    ### Database
+
+    A very common root cause of application slowness is slow SQL:
+
+    ```text
+    Application
+        ↓
+    Database Query
+        ↓
+    Slow SQL (e.g., full table scan due to missing index)
+        ↓
+    Application Waits
+        ↓
+    User Sees High Latency
+    ```
+
+    **What to investigate:**
+    - Query latency and slow query logs
+    - Missing indexes causing full table scans
+    - Lock contention between concurrent transactions
+    - High connection count approaching pool limits
+    - Database CPU, memory, and IOPS via CloudWatch
+    - Connection pool exhaustion
+
+    For Amazon RDS, use Performance Insights to identify the top wait events and most expensive queries by load.
+
+    ---
+
+    ### Cache (Redis / Memcached / ElastiCache)
+
+    A degraded cache creates an indirect database overload:
+
+    ```text
+    Cache Hit Ratio ↓
+           ↓
+    More Requests Reach the Database
+           ↓
+    Database Load ↑
+           ↓
+    Application Latency ↑
+    ```
+
+    **Metrics to check:** cache hit ratio, miss rate, eviction count (high evictions signal memory pressure), connection count, and per-command latency.
+
+    ---
+
+    ### External API Dependencies
+
+    If the application calls payment APIs, authentication services, third-party platforms, or internal microservices, a slow dependency directly adds to every user-facing request duration:
+
+    ```text
+    Application
+         ↓
+    External API
+         ↓
+    Response takes 5 seconds
+         ↓
+    Application request takes 5+ seconds
+    ```
+
+    <Warning>
+    Be careful with retry logic. If an external dependency is slow or returning errors and your application retries automatically, retries can multiply outbound traffic and turn a partial degradation into a full outage.
+    </Warning>
+
+    Check: dependency latency, timeout rate, error rate, retry count, connection failures, and circuit-breaker activity.
+
+    ---
+
+    ### AWS Service Throttling and Quotas
+
+    When infrastructure looks healthy but requests are still slow, check whether an AWS service is being throttled or approaching a service quota:
+
+    ```text
+    Traffic ↑
+       ↓
+    Service Limit Reached
+       ↓
+    Throttling
+       ↓
+    Retries
+       ↓
+    Latency ↑
+    ```
+
+    Common quota-related bottlenecks: Lambda concurrency limits, DynamoDB provisioned capacity, API Gateway rate limits, EC2 network bandwidth, and NAT Gateway connection limits.
+  </Step>
+
+  <Step title="Identify the Bottleneck and Fix the Root Cause">
+    Once you have correlated metrics and logs across all layers, you can pinpoint the actual bottleneck rather than treating symptoms:
+
+    ```text
+    ALB
+     ↓
+    TargetResponseTime = 6 seconds
+     ↓
+    EC2 CPU = 30%  |  Memory = Normal
+     ↓
+    Application logs show DB query = 5.5 seconds
+     ↓
+    Database is the bottleneck
+    ```
+
+    Always fix the **root cause**, not just the symptom:
+
+    | Symptom | Observation | Root Cause | Fix |
+    |---------|-------------|------------|-----|
+    | Application is slow | Database queries take 5 seconds | Missing index causes full table scan | Add index, optimize query |
+    | Application is slow | EC2 CPU at 100% | Single runaway process in infinite loop | Identify and kill process, fix code |
+    | Application is slow | Cache hit ratio dropped to 20% | Cache eviction due to memory pressure | Increase ElastiCache node size |
+
+    After applying the fix: validate the application is healthy, monitor for recurrence, and document the incident for the post-mortem.
+  </Step>
+</Steps>
+
+---
+
+## Diagnostic Commands at a Glance
+
+<CardGroup cols={2}>
+  <Card title="CPU & Processes" icon="microchip">
+    ```bash
+    top
+    htop
+    ps aux --sort=-%cpu
+    ```
+  </Card>
+  <Card title="Memory" icon="memory">
+    ```bash
+    free -h
+    ps aux --sort=-%mem
+    ```
+  </Card>
+  <Card title="System Overview" icon="chart-line">
+    ```bash
+    vmstat 1 5
+    ```
+  </Card>
+  <Card title="Disk Space & Inodes" icon="hard-drive">
+    ```bash
+    df -h
+    df -i
+    ```
+  </Card>
+  <Card title="Disk I/O" icon="database">
+    ```bash
+    iostat -xz 1 5
+    ```
+  </Card>
+  <Card title="Network & Connections" icon="network-wired">
+    ```bash
+    ss -tulpn
+    netstat -i
+    ```
+  </Card>
+  <Card title="DNS Checks" icon="globe">
+    ```bash
+    dig example.com
+    nslookup example.com
+    time dig example.com
+    ```
+  </Card>
+  <Card title="Kernel / System Logs" icon="scroll">
+    ```bash
+    dmesg | tail
+    tail -f /var/log/nginx/error.log
+    ```
+  </Card>
+</CardGroup>
+
+---
+
+## Common Root Causes by Category
+
+<Accordion title="Infrastructure: CPU, Memory, Disk">
+  - High CPU utilization or a single runaway process
+  - Low available memory causing swap activity
+  - Disk at 100% capacity or inode exhaustion
+  - Disk I/O saturation or exhausted EBS burst credits
+  - Insufficient EC2 instance capacity for the workload
+</Accordion>
+
+<Accordion title="Application: Code and Connections">
+  - Inefficient or unoptimized code paths
+  - Memory leaks causing gradual performance degradation
+  - Thread or process pool exhaustion
+  - Connection leaks (database or HTTP connections not closed)
+  - Expensive synchronous operations blocking the event loop
+</Accordion>
+
+<Accordion title="Database: Queries and Connections">
+  - Slow SQL queries due to missing indexes
+  - Lock contention between concurrent transactions
+  - High connection count approaching pool limits
+  - Database resource saturation (CPU, IOPS, RAM)
+  - Connection pool misconfiguration
+</Accordion>
+
+<Accordion title="Traffic: Spikes and Bot Activity">
+  - Sudden traffic spike exceeding provisioned capacity
+  - Bot traffic generating high request rates to specific endpoints
+  - Large numbers of concurrent users during peak hours
+  - Misconfigured load test targeting production
+</Accordion>
+
+<Accordion title="AWS Services: Throttling and Quotas">
+  - Lambda concurrency limit reached
+  - DynamoDB provisioned capacity exceeded
+  - API Gateway rate limit throttling
+  - NAT Gateway connection limits
+  - EC2 network bandwidth saturation
+</Accordion>
+
+<Accordion title="Dependencies: External APIs and Microservices">
+  - Slow external API adding latency to every request
+  - Excessive retries amplifying a partial outage
+  - Circuit breaker not configured, allowing cascading failures
+  - Internal microservice degradation propagating upstream
+</Accordion>
+
+---
+
+## SRE Mindset: The Full Incident Lifecycle
+
+As an SRE, the goal is not simply to "fix the slow application." The goal is to complete the full loop:
+
+```text
+Detect
+  ↓
+Isolate
+  ↓
+Diagnose
+  ↓
+Fix
+  ↓
+Validate
+  ↓
+Monitor
+  ↓
+Prevent Recurrence
+```
+
+For production systems, also consider SLI/SLO impact, error-budget consumption, distributed tracing (AWS X-Ray, OpenTelemetry), APM tooling, capacity planning, and load testing to establish performance baselines. A slow-application incident that does not produce a post-incident review is an incident that will likely repeat.
+
+---
+
+## Interview Answer: "Your application is very slow. How do you debug it?"
+
+<Tip>
+The strongest interview answers demonstrate structured methodology rather than a list of random tools. Here is a full response you can adapt:
+
+> "I would troubleshoot layer by layer rather than immediately assuming the application code is the problem. First, I would scope the issue — is it affecting all users or specific ones, all endpoints or one, and did it start after a deployment? Then I would follow the request path: check DNS and Route 53 health checks with `dig` and `nslookup`, then look at ALB CloudWatch metrics especially `TargetResponseTime` to determine whether the bottleneck is inside the application or its dependencies. On the EC2 layer I would use `top`, `free -h`, `vmstat`, `df -h`, `iostat`, and `ss` to check CPU, memory, disk, and connections. I would also tail the application and web server logs for timeouts, 5xx errors, and slow requests. If the compute layer looks healthy, I would investigate database query latency and slow query logs, cache hit ratio and eviction rate, and external API latency. Once I identify the layer where latency is introduced, I dig for the root cause — for example, a missing index causing full table scans — fix it, validate the application, and then add monitoring and alerting to catch it earlier next time."
+
+This demonstrates: structured thinking, AWS service knowledge, Linux operations, database awareness, and production SRE mindset — all in one answer.
+</Tip>

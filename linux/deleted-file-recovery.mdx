@@ -1,0 +1,336 @@
+---
+title: "Recovering Accidentally Deleted Linux Files in Production"
+sidebarTitle: "File Recovery"
+description: "Recover deleted Linux files using lsof and /proc fd, restore from EBS snapshots or backups, and use file-carving tools safely in production environments."
+---
+
+Accidentally deleting a file on a production Linux server is a high-stress situation, but the outcome depends entirely on what you do in the first two minutes. The most important instinct is *not* to immediately reach for a recovery tool — it is to stop writing to the affected filesystem and check whether the file is still held open by a running process. A single `lsof` command can turn a potential disaster into a five-second file copy. This guide walks through the complete recovery decision tree, from the easiest path to the most complex, with production safety rules throughout.
+
+<Warning>
+This guide is for education, interview preparation, and authorized troubleshooting. File recovery is **not guaranteed**. The result depends on the filesystem, storage type, permissions, available backups/snapshots, and whether the data blocks have been overwritten. On a production server: avoid unnecessary writes, do not experiment blindly, prefer restoring from a known-good backup or snapshot, and follow your organization's incident-response and change-management procedures.
+</Warning>
+
+---
+
+## How Linux Deletion Actually Works
+
+When you delete a file on Linux, the operating system removes its **directory entry** and decrements the file's **link count**. The actual data blocks on disk are not immediately wiped — they are simply marked as available for reuse. This distinction is critical for recovery:
+
+```text title="What deletion actually removes"
+File deleted
+     │
+     ├── Directory entry removed ✓
+     ├── Link count decremented ✓
+     └── Data blocks on disk → still present (until overwritten)
+```
+
+If a running process had the file open before deletion, it retains a valid file descriptor pointing to the underlying file object. The data remains accessible through that descriptor even after the directory entry is gone.
+
+---
+
+## Recovery Decision Tree
+
+Before taking any action, map your situation to one of these three paths:
+
+```text title="Recovery decision tree"
+             File accidentally deleted
+                       │
+                       ▼
+            Stop unnecessary writes
+                       │
+                       ▼
+              Check `lsof +L1`
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+            YES                  NO
+             │                   │
+             ▼                   ▼
+    File still open by       Check backup
+       a process?                │
+             │                   ▼
+             ▼             Backup exists?
+     Find PID + FD               │
+             │             ┌─────┴─────┐
+             ▼             │           │
+  Copy /proc/PID/fd/FD    YES          NO
+             │             │           │
+             ▼             ▼           ▼
+        Verify file     Restore    Check snapshot
+                                       │
+                                       ▼
+                                  Check git/history
+                                       │
+                                       ▼
+                              Filesystem recovery tools
+```
+
+---
+
+## Recovery Procedure
+
+<Steps>
+  <Step title="Stop unnecessary writes immediately">
+    The moment you realize a file has been deleted, the single most important action is to **stop writing to the affected filesystem**. Writing new data can overwrite the blocks belonging to the deleted file, making recovery impossible.
+
+    Avoid these operations on the affected disk until recovery is complete:
+
+    ```text title="Operations that risk overwriting deleted data"
+    Large downloads
+    Package installations
+    Large log generation
+    Copying files onto the same filesystem
+    Creating temporary files on the affected disk
+    ```
+
+    <Warning>
+    Do not install recovery tools onto the same filesystem that contains the deleted file. Write to a different disk or mount point.
+    </Warning>
+  </Step>
+
+  <Step title="Check whether the file is still open with lsof">
+    This is almost always the fastest path to recovery. A process can continue using a deleted file as long as it holds an open file descriptor — even after the directory entry has been removed.
+
+    Run:
+
+    ```bash title="Find deleted-but-open files"
+    sudo lsof +L1
+    ```
+
+    Filter to show only deleted entries:
+
+    ```bash title="Filter for deleted files"
+    sudo lsof +L1 | grep deleted
+    ```
+
+    Example output:
+
+    ```text title="lsof +L1 output"
+    COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NAME
+    app      1234 user    5w   REG    8,1  1048576    0  /var/log/app.log (deleted)
+    ```
+
+    **Understanding the key columns:**
+
+    | Column | Meaning |
+    |--------|---------|
+    | **PID** | Process ID that has the file open |
+    | **FD** | File descriptor number (`5w` = FD 5, open for writing) |
+    | **NLINK** | Link count — `0` confirms the directory entry is gone |
+    | **NAME** | Original file path, marked `(deleted)` |
+
+    If your file appears here, proceed to Step 3. If not, skip to Step 4.
+  </Step>
+
+  <Step title="Recover the file through /proc">
+    Linux exposes every open file descriptor for every running process through the virtual filesystem at:
+
+    ```text
+    /proc/<PID>/fd/<FD>
+    ```
+
+    From the `lsof` output in Step 2: `PID = 1234`, `FD = 5`.
+
+    First, verify the descriptor still points to your deleted file:
+
+    ```bash title="Inspect the file descriptor"
+    sudo ls -l /proc/1234/fd/5
+    ```
+
+    You should see:
+
+    ```text title="Expected output"
+    /proc/1234/fd/5 -> /var/log/app.log (deleted)
+    ```
+
+    Now copy the contents to a safe location **on a different filesystem**:
+
+    ```bash title="Recover the deleted file"
+    sudo cp /proc/1234/fd/5 /tmp/recovered_app.log
+    ```
+
+    Verify the recovered file:
+
+    ```bash title="Verify the recovered file"
+    ls -lh /tmp/recovered_app.log
+    file /tmp/recovered_app.log
+    head /tmp/recovered_app.log
+    ```
+
+    **Why this works — conceptually:**
+
+    ```text title="Open file descriptor chain"
+    /var/log/app.log
+           │
+           X  ← directory entry deleted
+           │
+           ▼
+       File object still referenced by FD
+           │
+           ▼
+    /proc/1234/fd/5
+           │
+           ▼
+    Underlying data blocks (still intact)
+    ```
+
+    <Warning>
+    The `/proc/<PID>/fd/<FD>` path disappears the moment the process restarts, closes the file, or is terminated. **Copy the file before doing anything that would stop the holding process**, unless your incident procedure requires otherwise.
+    </Warning>
+  </Step>
+
+  <Step title="Restore from backup or snapshot">
+    If `lsof +L1` shows no open handle, backups and snapshots are the preferred production recovery path.
+
+    **Option A — Restore from backup:**
+
+    ```text title="Common backup sources"
+    Backup server
+    Cloud backup (AWS Backup, S3 versioning)
+    Database/application backup
+    Object storage backup
+    Filesystem backup
+    ```
+
+    Restore from the latest known-good copy and verify the result.
+
+    **Option B — Restore from an AWS EBS snapshot:**
+
+    AWS EBS snapshots can be one of the fastest recovery options for EC2-hosted workloads. A snapshot can be restored to a new volume and mounted to recover the specific file without touching the original disk.
+
+    Other snapshot types include:
+
+    ```text title="Snapshot sources"
+    AWS EBS snapshots
+    GCP Persistent Disk snapshots
+    Azure managed disk snapshots
+    LVM snapshots
+    Storage-array snapshots
+    VM snapshots
+    ```
+
+    **Option C — Check version control:**
+
+    If the deleted file was configuration, code, or another versioned artifact, check its history:
+
+    ```bash title="Find a deleted file in Git history"
+    git log --all -- path/to/file
+    ```
+
+    ```bash title="Inspect a previous version"
+    git show <commit>:path/to/file
+    ```
+  </Step>
+
+  <Step title="Consider filesystem-level recovery tools (last resort)">
+    If there is no open file descriptor, no usable backup, and no snapshot, filesystem recovery tools may help — but they require careful handling and should generally be run against an **unmounted device** or a disk image, never against a live production filesystem.
+
+    <Warning>
+    Do not run these tools blindly against a production filesystem. Filesystem recovery normally requires the device to be unmounted to prevent further changes during the scan.
+    </Warning>
+
+    **`extundelete` — for ext3/ext4 filesystems:**
+
+    ```bash title="Attempt to recover a specific file"
+    sudo umount /dev/sdX
+    sudo extundelete /dev/sdX --restore-file path/to/file
+    ```
+
+    ```bash title="Attempt broader recovery"
+    sudo extundelete /dev/sdX --restore-all
+    ```
+
+    **TestDisk — partition and filesystem recovery:**
+
+    ```text title="TestDisk workflow"
+    sudo testdisk
+        │
+        ├── Select disk
+        ├── Select partition
+        ├── Analyse / Advanced
+        ├── Select appropriate recovery option
+        └── Copy recovered data to another storage location
+    ```
+
+    **PhotoRec — file carving by file signature:**
+
+    ```bash title="Run PhotoRec against a device"
+    sudo photorec /dev/sdX
+    ```
+
+    PhotoRec does not rely on filesystem metadata — it searches raw storage for known file signatures. However, it may lose original filenames, directory structure, and can produce many unrelated files.
+
+    **Scalpel — configurable file carving:**
+
+    ```bash title="Run Scalpel against a device"
+    sudo scalpel /dev/sdX -o /recovery
+    ```
+
+    Always recover data to a **different storage location** than the source device.
+  </Step>
+</Steps>
+
+---
+
+## Production Safety Rules
+
+<CardGroup cols={2}>
+  <Card title="Stop Writes First" icon="ban">
+    The instant you realize a file has been deleted, stop all unnecessary writes to the affected filesystem. Every write risks overwriting recoverable data blocks.
+  </Card>
+  <Card title="Check lsof Immediately" icon="magnifying-glass">
+    Run `sudo lsof +L1` as your first diagnostic step. An open file descriptor turns a hard recovery into a simple `cp` command.
+  </Card>
+  <Card title="Recover to Different Storage" icon="hard-drive">
+    Never write recovered data back to the same filesystem. Use a separate mount point, EBS volume, or remote storage.
+  </Card>
+  <Card title="Prefer Backups Over Tools" icon="database">
+    For production systems, restoring from a verified backup or EBS snapshot is safer and more reliable than filesystem recovery tools.
+  </Card>
+</CardGroup>
+
+---
+
+## Quick Command Reference
+
+```bash title="Find deleted-but-open files"
+sudo lsof +L1
+```
+
+```bash title="Filter for deleted entries only"
+sudo lsof +L1 | grep deleted
+```
+
+```bash title="Inspect a process file descriptor"
+sudo ls -l /proc/<PID>/fd/<FD>
+```
+
+```bash title="Recover an open deleted file"
+sudo cp /proc/<PID>/fd/<FD> /safe/location/recovered_file
+```
+
+```bash title="Verify the recovered file"
+file /safe/location/recovered_file
+ls -lh /safe/location/recovered_file
+```
+
+```bash title="Check Git history for a deleted file"
+git log --all -- path/to/file
+git show <commit>:path/to/file
+```
+
+---
+
+## Key Takeaways
+
+<Note>
+The first question to ask when a file is deleted is **not** "Which recovery tool should I use?" — it is: **"Is the deleted file still open by a running process?"** That single check with `lsof +L1` can turn a potentially unrecoverable situation into a five-second file copy.
+</Note>
+
+1. **Do not panic** — and do not start writing to the affected disk.
+2. Check for deleted-but-open files immediately with `sudo lsof +L1`.
+3. If the file is still open, copy it via `/proc/<PID>/fd/<FD>` before the process closes or restarts.
+4. Prefer **backups and EBS snapshots** for production recovery — they are safer than low-level tools.
+5. Recover to **different storage** whenever possible.
+6. Only consider filesystem recovery or file-carving tools when no other option exists, and do so against an unmounted device or disk image.
+7. Recovery is **not guaranteed** once the underlying data blocks have been overwritten.

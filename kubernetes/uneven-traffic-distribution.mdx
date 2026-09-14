@@ -1,0 +1,407 @@
+---
+title: "Only 3 of 10 Pods Receiving Traffic: SOP for Uneven Load"
+sidebarTitle: "Uneven Traffic"
+description: "Structured SOP for diagnosing uneven Kubernetes traffic distribution — covering Service selectors, readiness probes, EndpointSlices, session affinity, and Ingress config."
+---
+
+A production deployment with 10 running pods but only 3 receiving traffic is a serious reliability risk. The three active pods absorb all load — potentially 1,000 requests per second each instead of the expected 300 — while the other seven sit idle. The result is elevated CPU and memory on the active pods, increased latency, request timeouts, and reduced fault tolerance. If any of the three active pods fails, the application may go down entirely. This SOP provides a structured approach to identify exactly which layer is excluding the other pods from the traffic path and restore correct distribution.
+
+<Note>
+**Key principle:** A Kubernetes Service does **not** route traffic to a pod simply because it is in `Running` state. A pod must match the Service selector labels, pass its readiness probe, and listen on the correct port before it becomes an eligible backend. `Running` ≠ eligible for traffic.
+</Note>
+
+## Scenario Overview
+
+```text
+Users
+  |
+  v
+Ingress / Load Balancer
+  |
+  v
+Kubernetes Service
+  |
+  v
+EndpointSlices / Endpoints
+  |
+  +-----------------------------+
+  | Pod 1  - Receiving Traffic  |
+  | Pod 2  - Receiving Traffic  |
+  | Pod 3  - Receiving Traffic  |
+  | Pod 4  - No Traffic         |
+  | Pod 5  - No Traffic         |
+  | Pod 6  - No Traffic         |
+  | Pod 7  - No Traffic         |
+  | Pod 8  - No Traffic         |
+  | Pod 9  - No Traffic         |
+  | Pod 10 - No Traffic         |
+  +-----------------------------+
+```
+
+## Impact Assessment
+
+Assuming the application receives 3,000 requests per second:
+
+| Distribution | Requests per Pod |
+|---|---|
+| **Expected** (10 pods) | ~300 req/s per pod |
+| **Actual** (3 pods) | ~1,000 req/s per pod |
+
+The three active pods are processing 3× their expected load. This increases latency, causes potential timeouts, risks OOMKilled containers, and reduces fault tolerance to near zero.
+
+---
+
+## High-Level Troubleshooting Flow
+
+```text
+Service Selector
+      |
+      v
+Pod Labels
+      |
+      v
+Endpoints / EndpointSlices
+      |
+      v
+Pod Readiness
+      |
+      v
+Application Health
+      |
+      v
+Service Port / targetPort
+      |
+      v
+Session Affinity / Sticky Sessions
+      |
+      v
+Ingress / Load Balancer
+      |
+      v
+Network Policies (if required)
+```
+
+The goal at each layer: **at which layer are the other 7 pods being removed from the traffic path?**
+
+---
+
+## Step-by-Step Investigation Workflow
+
+<Steps>
+  <Step title="Check the Kubernetes Service and its selector">
+    Verify that the Service is configured to route traffic to all intended pods. The selector is the gating mechanism — only pods matching it can receive traffic.
+
+    ```bash
+    kubectl get svc -n <namespace>
+    kubectl describe svc <service-name> -n <namespace>
+    kubectl get svc <service-name> -n <namespace> -o yaml
+    ```
+
+    In the output, look for:
+
+    ```yaml
+    spec:
+      selector:
+        app: my-app
+      ports:
+        - port: 80
+          targetPort: 8080
+    ```
+
+    **Key question:** Does this selector match all 10 pods, or only 3?
+  </Step>
+
+  <Step title="Verify pod labels on all 10 pods">
+    Compare pod labels against the Service selector. If only 3 pods carry the matching label, only those 3 will receive traffic — regardless of whether the others are running.
+
+    ```bash
+    kubectl get pods -n <namespace> --show-labels
+    ```
+
+    Example output that reveals a split:
+
+    ```text
+    NAME       LABELS
+    pod-1      app=my-app
+    pod-2      app=my-app
+    pod-3      app=my-app
+    pod-4      app=my-app-v2
+    pod-5      app=my-app-v2
+    ```
+
+    If the Service selector is `app: my-app`, pods 4 and 5 (and any others with `app=my-app-v2`) are invisible to the Service. This happens frequently during rolling deployments when new pods from a different ReplicaSet carry different labels or version annotations.
+
+    **Resolution:** Correct the pod labels or update the Service selector to match all intended pods.
+
+    ```bash
+    # Verify after correction
+    kubectl get pods -n <namespace> --show-labels
+    kubectl describe svc <service-name> -n <namespace>
+    ```
+  </Step>
+
+  <Step title="Check Endpoints and EndpointSlices">
+    This is the definitive check — it shows exactly how many pod IPs are registered behind the Service. If only 3 IPs appear, the problem is before or at the endpoint registration layer.
+
+    ```bash
+    kubectl get endpoints <service-name> -n <namespace>
+    kubectl describe endpoints <service-name> -n <namespace>
+    ```
+
+    For EndpointSlices (Kubernetes 1.17+):
+
+    ```bash
+    kubectl get endpointslices -n <namespace> \
+      -l kubernetes.io/service-name=<service-name>
+    kubectl describe endpointslice <endpointslice-name> -n <namespace>
+    ```
+
+    **Scenario A: Only 3 pod IPs are registered**
+
+    ```text
+    10 Pods Running
+           |
+           v
+    Only 3 Pod IPs in EndpointSlice
+    ```
+
+    The problem is at the selector or readiness layer. Go back to Step 2 or proceed to Step 4.
+
+    **Scenario B: All 10 pod IPs are registered**
+
+    All pods are eligible backends. The problem is higher in the traffic path — session affinity, Ingress sticky sessions, or Load Balancer behavior. Skip to Step 6.
+  </Step>
+
+  <Step title="Check pod readiness on all 10 pods">
+    A pod that is `Running` but not `Ready` is automatically excluded from Service backends by Kubernetes. This is the correct behavior — it prevents unhealthy pods from receiving traffic — but it explains why only some pods serve requests.
+
+    ```bash
+    kubectl get pods -n <namespace>
+    ```
+
+    Look at the `READY` column:
+
+    ```text
+    NAME        READY   STATUS
+    pod-1       1/1     Running     ← Ready, receives traffic
+    pod-2       1/1     Running     ← Ready, receives traffic
+    pod-3       1/1     Running     ← Ready, receives traffic
+    pod-4       0/1     Running     ← NOT Ready, excluded from Service
+    ```
+
+    Inspect a non-ready pod:
+
+    ```bash
+    kubectl describe pod <pod-name> -n <namespace>
+    ```
+
+    Check the `Events` section for readiness probe failures:
+
+    ```text
+    Readiness probe failed: HTTP probe failed with statuscode: 503
+    ```
+
+    A readiness probe example:
+
+    ```yaml
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    ```
+
+    Probe failures can be caused by: wrong health check path, wrong port, application not fully started, database or external dependency unavailable, or probe timeout too short.
+
+    ```bash
+    kubectl get events -n <namespace> \
+      --sort-by='.metadata.creationTimestamp'
+    ```
+
+    <Warning>
+    Do not disable readiness probes in production as a quick fix. They exist to protect users from receiving traffic from unhealthy pods. Instead, fix the underlying application or probe configuration issue.
+    </Warning>
+  </Step>
+
+  <Step title="Check application health on non-receiving pods">
+    Even if pods show as Ready, compare logs between pods receiving traffic and those that are not:
+
+    ```bash
+    kubectl logs <pod-receiving-traffic> -n <namespace>
+    kubectl logs <pod-not-receiving-traffic> -n <namespace>
+    kubectl logs <pod-name> --previous -n <namespace>
+    ```
+
+    Look for: startup failures, database connection failures, configuration errors, port binding errors, and dependency failures.
+
+    Also compare pod configurations to identify any differences:
+
+    ```bash
+    kubectl describe pod <pod-name> -n <namespace>
+    ```
+
+    Verify that environment variables, ConfigMaps, Secrets, and volume mounts are consistent across all pods.
+  </Step>
+
+  <Step title="Check Service targetPort and application listening port">
+    Verify that the Service `targetPort` matches the port the application is actually listening on inside the container:
+
+    ```bash
+    kubectl get svc <service-name> -n <namespace> -o yaml
+    ```
+
+    Expected alignment:
+
+    ```text
+    Service targetPort: 8080
+                |
+                v
+    Application listens on: 8080
+    ```
+
+    Test connectivity to a specific pod from inside the cluster:
+
+    ```bash
+    kubectl run debug \
+      -it \
+      --rm \
+      --restart=Never \
+      --image=curlimages/curl \
+      -n <namespace> \
+      -- sh
+    ```
+
+    Then inside the debug pod:
+
+    ```bash
+    curl http://<service-name>
+    curl http://<pod-ip>:<port>
+    ```
+  </Step>
+
+  <Step title="Check session affinity and sticky sessions">
+    If all 10 pods are registered in EndpointSlices but traffic still concentrates on 3, session affinity is likely responsible. Check the Service:
+
+    ```bash
+    kubectl get svc <service-name> -n <namespace> -o yaml
+    ```
+
+    Look for:
+
+    ```yaml
+    sessionAffinity: ClientIP
+    ```
+
+    Default is `None`. When `ClientIP` affinity is enabled, requests from the same client IP are consistently routed to the same pod. If your traffic originates from only a few source IPs (common behind a NAT gateway or when load testing from a single host), most traffic hits the same pods.
+
+    Also check for Ingress-level sticky session annotations, which are controller-specific but commonly look like:
+
+    ```bash
+    kubectl describe ingress <ingress-name> -n <namespace>
+    ```
+
+    Look for cookie-based affinity annotations in the Ingress metadata.
+  </Step>
+
+  <Step title="Check Ingress and external Load Balancer">
+    If all Kubernetes-side configuration looks correct, investigate the Ingress controller and any external load balancer:
+
+    ```bash
+    kubectl get ingress -n <namespace>
+    kubectl describe ingress <ingress-name> -n <namespace>
+    kubectl get ingress <ingress-name> -n <namespace> -o yaml
+    ```
+
+    Check the Ingress controller logs for upstream health check failures or routing errors:
+
+    ```bash
+    kubectl get pods -n <ingress-namespace>
+    kubectl logs <ingress-controller-pod> -n <ingress-namespace>
+    ```
+
+    At the cloud Load Balancer level, verify: target health status, health check path and port, backend registration, and load balancing algorithm. A cloud LB can mark Kubernetes pods as unhealthy even when Kubernetes itself considers them ready.
+  </Step>
+
+  <Step title="Check NetworkPolicies">
+    If specific pods are unreachable despite correct configuration at all other layers, a NetworkPolicy may be blocking traffic to certain pods based on their labels:
+
+    ```bash
+    kubectl get networkpolicy -n <namespace>
+    kubectl describe networkpolicy <policy-name> -n <namespace>
+    ```
+
+    Verify that ingress rules allow traffic from the Ingress controller and other clients to all pods — not just a subset defined by label selectors.
+  </Step>
+
+  <Step title="Validate the fix and confirm distribution">
+    After remediation, verify that all pods are registered and traffic distribution normalizes:
+
+    ```bash
+    kubectl get pods -n <namespace>
+    kubectl get endpoints <service-name> -n <namespace>
+    kubectl get endpointslices -n <namespace> \
+      -l kubernetes.io/service-name=<service-name>
+    ```
+
+    Monitor per-pod metrics to confirm balanced distribution:
+    - Requests per pod
+    - CPU and memory utilization per pod
+    - Error rate per pod
+    - Response latency per pod
+  </Step>
+</Steps>
+
+---
+
+## Common Root Causes Reference
+
+<CardGroup cols={2}>
+  <Card title="Label / Selector Mismatch" icon="tag">
+    Only pods with labels matching the Service selector receive traffic. Pods from a different ReplicaSet or with updated labels are excluded. Fix by aligning labels and selector.
+  </Card>
+  <Card title="Readiness Probe Failure" icon="heart-pulse">
+    Pods are `Running` but `0/1 Ready`. Kubernetes removes them from Service backends. Fix the health endpoint, probe path/port, or the dependency causing the failure.
+  </Card>
+  <Card title="Session Affinity (ClientIP)" icon="link">
+    Traffic from the same source IPs sticks to the same pods. All endpoints are registered but load is concentrated. Disable affinity or review whether it is actually needed.
+  </Card>
+  <Card title="Ingress Sticky Sessions" icon="cookie">
+    Cookie-based affinity at the Ingress layer pins users to specific pods. All pods are healthy but session cookies drive uneven load. Review Ingress controller annotations.
+  </Card>
+  <Card title="Wrong targetPort" icon="plug">
+    Service forwards traffic to a port the application is not listening on. Pods are registered as endpoints but connections fail. Align `targetPort` with the actual listening port.
+  </Card>
+  <Card title="Load Balancer Health Checks" icon="shield-check">
+    External LB marks some Kubernetes pods as unhealthy due to health check path/port mismatch. Fix health check configuration at the LB level to match the application's actual health endpoint.
+  </Card>
+</CardGroup>
+
+---
+
+## Safe Remediation Principles
+
+<Tip>
+Before making any configuration change in production: identify the root cause first, record the current configuration, make one change at a time, validate the result, and monitor traffic distribution before closing the incident.
+</Tip>
+
+```text
+1. Identify the root cause (which layer excludes the pods)
+2. Avoid changing multiple layers simultaneously
+3. Record current configuration before changes
+4. Make one controlled change
+5. Validate: check endpoints, pod readiness, metrics
+6. Monitor traffic distribution for 5–10 minutes
+7. Roll back if the change introduces new impact
+```
+
+---
+
+## Monitoring to Detect This Early
+
+Set up alerts for these conditions to catch uneven traffic distribution before users are affected:
+
+- `Desired Replicas != Ready Replicas` — pod count mismatch
+- `Available Endpoints < Expected Healthy Pods` — endpoint registration failures
+- Significant per-pod traffic imbalance — e.g., one pod receiving 5× more requests than others
+- Readiness probe failure rate greater than zero — early warning before pods are excluded

@@ -1,0 +1,472 @@
+---
+title: "AWS DDoS Protection: WAF, Shield, and Defense in Depth"
+sidebarTitle: "DDoS & WAF"
+description: "Learn to distinguish DDoS attacks from traffic spikes, configure WAF rules and Shield tiers, and build a layered AWS defense-in-depth protection architecture."
+---
+
+When thousands of requests per second suddenly hit your AWS application, the first and most important question is not "how do I block this?" — it is "is this an attack or a legitimate spike?" Treating every high-traffic event as a DDoS attack risks blocking real users, while treating every attack as a capacity problem leads to runaway scaling costs and downstream saturation. AWS provides a layered defense-in-depth stack — Route 53, CloudFront, AWS Shield, AWS WAF, ALB, and Auto Scaling — where each component plays a distinct role. Understanding what each layer does, when it acts, and what its limits are is the foundation of a production-grade DDoS protection strategy.
+
+---
+
+## What Is a DDoS Attack?
+
+DDoS stands for **Distributed Denial of Service**. The objective is to overwhelm an application, network, or service with enough traffic or requests that legitimate users cannot access it.
+
+A DDoS attack can involve:
+
+- Huge volumes of network or transport-layer traffic
+- Large numbers of HTTP/HTTPS requests (HTTP flood)
+- Bot-generated automated requests from many IP addresses
+- Repeated requests targeting expensive application endpoints
+- Attempts to exhaust CPU, memory, database connections, or worker threads
+
+**Simple example of scale:**
+
+```text
+Normal traffic:  1,000 requests/sec
+Attack traffic:  200,000 requests/sec
+```
+
+If the application cannot absorb this, users experience high latency, HTTP 5xx errors, timeouts, connection failures, and increased infrastructure cost.
+
+---
+
+## DDoS Attack vs. Legitimate Traffic Spike
+
+<Tabs>
+  <Tab title="Legitimate Traffic Spike">
+    ### What it looks like
+
+    ```text
+    Normal traffic  →  1K req/sec
+    Product launch  →  20K req/sec
+    ```
+
+    Requests come from real users distributed geographically, following normal browsing patterns — varying endpoints, reasonable session behavior, organic referrers.
+
+    ### Correct response
+
+    - ALB for load distribution
+    - Auto Scaling to add EC2 capacity
+    - CloudFront caching to reduce origin load
+    - Database read replicas or connection pooling
+    - Application-level optimization
+
+    <Note>
+      Scaling is the right response to legitimate demand. Blocking it harms real users and revenue.
+    </Note>
+  </Tab>
+  <Tab title="DDoS Attack">
+    ### What it looks like
+
+    ```text
+    Normal traffic  →  1K req/sec
+    Attack traffic  →  200K req/sec
+    ```
+
+    Requests show anomalous patterns: concentrated source IPs or bot networks, repetitive targeting of the same endpoint, abnormal HTTP methods, missing or malformed headers, no meaningful session behavior.
+
+    ### Correct response
+
+    - AWS Shield for network/transport-layer protection
+    - AWS WAF managed rule groups and IP reputation rules
+    - Rate-based rules to throttle aggressive sources
+    - Custom rules targeting the specific attack pattern
+    - Monitoring and alerting via CloudWatch + WAF logs
+    - Scope-down statements to protect expensive endpoints
+
+    <Warning>
+      Auto Scaling alone is dangerous during a DDoS attack. Scaling without filtering allows malicious traffic to consume resources and potentially saturate your database, cache, and downstream services — while your bill grows.
+    </Warning>
+  </Tab>
+</Tabs>
+
+---
+
+## Defense-in-Depth: Layered Protection Stack
+
+A strong production architecture applies protection at every layer, so malicious traffic is filtered as early as possible before it reaches the application.
+
+<Steps>
+  <Step title="Amazon Route 53 — DNS Layer">
+    Route 53 provides highly available DNS resolution and routing. It supports routing policies and health checks that can redirect traffic away from unhealthy endpoints.
+
+    ```text
+    www.example.com
+           |
+           v
+        Route 53
+           |
+           v
+    Application endpoint
+    ```
+
+    <Note>
+      Route 53 is **not** the primary HTTP DDoS filtering layer. It provides DNS availability and routing — Shield and WAF provide dedicated DDoS and application-layer protection.
+    </Note>
+  </Step>
+
+  <Step title="Amazon CloudFront — Edge CDN Layer">
+    CloudFront distributes your application globally across AWS edge locations, providing:
+
+    - Global edge distribution (traffic absorbed closer to attackers)
+    - Caching of static content (reduces origin requests)
+    - TLS termination at the edge
+    - Native integration with AWS WAF
+
+    For cacheable content, CloudFront cache hits absorb repeated requests without reaching the origin at all:
+
+    ```text
+    User
+     |
+     v
+    CloudFront
+     |
+     +---- Cache HIT  ----> Response (origin never touched)
+     |
+     +---- Cache MISS ---> Origin (WAF + ALB)
+    ```
+
+    For dynamic content, WAF rules and rate limiting at the CloudFront distribution become critical.
+  </Step>
+
+  <Step title="AWS Shield — DDoS Protection Layer">
+    AWS Shield is AWS's managed DDoS protection service with two tiers:
+
+    **Shield Standard** is automatically included with AWS services at no extra cost. It provides baseline protection against common network and transport-layer DDoS attacks for eligible resources. You do not manually enable it — it is always active.
+
+    **Shield Advanced** is a paid service for business-critical workloads. It provides:
+    - Enhanced DDoS detection and mitigation
+    - Additional visibility into attack telemetry
+    - DDoS response support
+    - Integration with AWS WAF
+    - Additional protections for supported resources (CloudFront, ALB, Route 53, EC2, Global Accelerator)
+
+    <Note>
+      Shield Standard is automatically active — Shield Advanced is a separately purchased offering evaluated based on business impact, availability requirements, and attack risk.
+    </Note>
+  </Step>
+
+  <Step title="AWS WAF — Application Firewall Layer">
+    AWS WAF operates at the HTTP/HTTPS request layer. A **Web ACL** contains ordered rules that inspect each incoming request and apply an action:
+
+    ```text
+    ALLOW     — pass the request through
+    BLOCK     — reject the request
+    COUNT     — count without blocking (used for testing)
+    CHALLENGE — serve a CAPTCHA or browser challenge
+    ```
+
+    A Web ACL can be associated with:
+    - CloudFront distributions
+    - Application Load Balancers
+    - API Gateway
+    - AppSync
+
+    WAF rules are evaluated in priority order. The first matching rule's action is applied.
+
+    #### Managed Rule Groups
+
+    AWS provides managed rule groups protecting against common threats including web exploits, malicious request patterns, IP reputation, and known attack signatures. Managed rules reduce the need to build every security rule from scratch.
+
+    ```text
+    Incoming request
+           |
+           v
+        AWS WAF
+           |
+           v
+    Managed Rule Groups
+           |
+           +---- Malicious pattern ---------> BLOCK
+           +---- IP reputation match -------> BLOCK
+           +---- Suspicious (testing mode) -> COUNT
+           +---- Normal traffic ------------> Continue
+    ```
+
+    #### IP Reputation Lists
+
+    The `AWSManagedRulesAmazonIpReputationList` rule group uses AWS threat intelligence to identify IP addresses associated with malicious activity:
+
+    ```text
+    AWSManagedIPReputationList    — known malicious IPs
+    AWSManagedReconnaissanceList  — scanning/recon activity
+    AWSManagedIPDDoSList          — DDoS-associated IPs
+    ```
+
+    <Note>
+      IP reputation alone is not sufficient. Attackers use large botnets, rotating IPs, residential proxies, and cloud infrastructure. Always combine IP reputation with rate-based rules, managed rules, and application-specific controls.
+    </Note>
+
+    #### Rate-Based Rules
+
+    Rate-based rules are one of the most effective defenses against HTTP floods. A rate-based rule tracks requests by an aggregation key (typically source IP) over an evaluation window and applies the configured action when the threshold is exceeded.
+
+    ```text
+    IP address sends requests:
+    50  requests  → Allowed
+    80  requests  → Allowed
+    120 requests  → Rate limit exceeded → BLOCK
+    ```
+
+    **Scope-down statements** narrow which requests a rate-based rule evaluates, enabling targeted protection of expensive endpoints:
+
+    ```text
+    Rate-Based Rule
+          |
+          v
+    Scope Down Statement
+          |
+          +---- URI starts with /login
+          +---- URI starts with /checkout
+          +---- URI starts with /generate-report
+          |
+          v
+    Apply strict rate limit only to these paths
+    ```
+
+    This avoids false positives on high-volume static asset requests while protecting expensive dynamic endpoints.
+
+    #### Custom Rules
+
+    Custom rules enforce application-specific behavior:
+
+    ```text
+    Block a known malicious IP:
+      IP = 203.0.113.10 → BLOCK
+
+    Restrict admin endpoint:
+      /admin/* → Allow only trusted source IPs
+
+    Restrict HTTP methods:
+      Unexpected DELETE request → BLOCK
+
+    Geographic restrictions:
+      Requests from unexpected regions → Additional inspection
+    ```
+
+    <Warning>
+      Do not apply a single aggressive global rate limit (e.g., block every IP over 100 req/min) without analysis. Corporate NAT gateways route thousands of users through a small number of public IPs. Tune thresholds based on measured application behavior.
+    </Warning>
+  </Step>
+
+  <Step title="Application Load Balancer — Traffic Distribution Layer">
+    The ALB distributes requests across healthy application targets, providing:
+    - Load distribution across EC2 instances and Availability Zones
+    - Health checks to route away from unhealthy targets
+    - TLS termination
+    - Native integration with AWS WAF
+
+    ```text
+              ALB
+               |
+       +-------+-------+
+       |       |       |
+      EC2     EC2     EC2
+    ```
+
+    The ALB is not your DDoS strategy — it is the delivery mechanism for traffic that has already been filtered by WAF and Shield.
+  </Step>
+
+  <Step title="Auto Scaling — Capacity Layer for Legitimate Traffic">
+    After malicious traffic is filtered, Auto Scaling handles legitimate demand increases by adding EC2 instances automatically.
+
+    ```text
+    Normal traffic:     ALB → 3x EC2
+    High legit traffic: ALB → 6x EC2 (scaled out)
+    ```
+
+    **Auto Scaling is not a DDoS mitigation tool.** If malicious requests pass through unfiltered, scaling only increases your cost while allowing the attack to continue:
+
+    ```text
+    DDoS traffic → ALB → Auto Scaling → More EC2 → Higher cost
+                                      → Database saturation
+                                      → Cache pressure
+                                      → Queue growth
+    ```
+
+    The correct strategy: filter first, then scale.
+
+    ```text
+    Detect → Filter → Rate Limit → Block → Scale legitimate traffic
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Complete Production Architecture
+
+```text
+                     INTERNET
+                        |
+                        v
+                +---------------+
+                |   Route 53    |  DNS + health routing
+                +---------------+
+                        |
+                        v
+                +---------------+
+                |  CloudFront   |  CDN + edge WAF
+                +---------------+
+                        |
+                        v
+                +---------------+
+                |   AWS WAF     |
+                | Managed Rules |
+                | IP Reputation |
+                | Custom Rules  |
+                | Rate Limits   |
+                +---------------+
+                        |
+                        v
+                +---------------+
+                |  AWS Shield   |  DDoS protection
+                +---------------+
+                        |
+                        v
+                +---------------+
+                |      ALB      |  Load distribution
+                +---------------+
+                   /    |    \
+                  v     v     v
+                EC2   EC2   EC2    Auto Scaling Group
+                  \    |    /
+                   +---+---+
+                       |
+                       v
+                  Backend / DB
+```
+
+---
+
+## WAF Rule Testing: Count Before Block
+
+During rule development, always observe before enforcing:
+
+<Tabs>
+  <Tab title="Count Mode (Testing)">
+    ```text
+    Request
+      |
+      v
+    Rule matches
+      |
+      v
+    COUNT  ← request continues, just logged
+    ```
+
+    Use Count mode to:
+    - Understand which requests match the rule
+    - Identify false positives before blocking
+    - Measure traffic patterns and baselines
+  </Tab>
+  <Tab title="Block Mode (Production)">
+    ```text
+    Request
+      |
+      v
+    Rule matches
+      |
+      v
+    BLOCK  ← request stopped at WAF
+    ```
+
+    Switch to Block only after:
+    - Analyzing WAF logs in Count mode
+    - Confirming false positive rate is acceptable
+    - Tuning rule conditions and thresholds
+  </Tab>
+</Tabs>
+
+<Tip>
+  The recommended production approach: **Test → Count → Analyze logs → Tune rule → Block**. Never blindly enable a broad managed rule group in Block mode without validation against your actual traffic.
+</Tip>
+
+---
+
+## Monitoring During an Attack
+
+Visibility is essential. Monitor these signals via Amazon CloudWatch and WAF logs:
+
+| Signal | Source | What It Tells You |
+|---|---|---|
+| Blocked requests count | AWS WAF metrics | Attack volume being stopped |
+| Allowed requests count | AWS WAF metrics | Legitimate traffic reaching ALB |
+| ALB request count | ALB metrics | Total load on the application |
+| ALB 5xx error rate | ALB metrics | Application/backend saturation |
+| ALB target response time | ALB metrics | Performance degradation |
+| EC2 CPU utilization | CloudWatch | Instance-level load |
+| Auto Scaling activity | CloudWatch | Capacity changes |
+| WAF log detail | WAF logs | Exact IPs, URIs, matched rules |
+
+Create CloudWatch alarms for abnormal thresholds:
+
+```text
+IF blocked WAF requests > threshold
+        |
+        v
+CloudWatch Alarm
+        |
+        v
+SNS notification / PagerDuty / incident workflow
+```
+
+WAF logs provide the detailed forensics needed to tune rules, identify attack patterns, and avoid blocking legitimate users.
+
+---
+
+## Key AWS CLI Commands
+
+```bash title="List all Web ACLs in a region"
+aws wafv2 list-web-acls --scope REGIONAL --region us-east-1
+```
+
+```bash title="Get details of a specific Web ACL"
+aws wafv2 get-web-acl --name MyWebACL --scope REGIONAL --id <acl-id> --region us-east-1
+```
+
+```bash title="List available managed rule groups"
+aws wafv2 list-available-managed-rule-groups --scope REGIONAL --region us-east-1
+```
+
+```bash title="Get rate-based rule managed keys (currently throttled IPs)"
+aws wafv2 get-rate-based-statement-managed-keys \
+  --scope REGIONAL \
+  --region us-east-1 \
+  --web-acl-name MyWebACL \
+  --web-acl-id <acl-id> \
+  --rule-name MyRateBasedRule
+```
+
+<Note>
+  Always verify the `--scope` parameter: use `REGIONAL` for ALB/API Gateway and `CLOUDFRONT` for CloudFront distributions. CloudFront WAF Web ACLs must be created in `us-east-1`.
+</Note>
+
+---
+
+## Common Interview Mistakes
+
+<Accordion title="Mistake: 'Auto Scaling will solve the DDoS attack'">
+  Auto Scaling adds compute capacity but cannot distinguish malicious from legitimate traffic. Scaling under attack increases infrastructure cost while potentially saturating downstream resources (RDS, Redis, internal APIs). Filter malicious traffic with WAF and Shield before relying on scaling.
+</Accordion>
+
+<Accordion title="Mistake: 'WAF blocks all DDoS attacks'">
+  AWS WAF focuses on application-layer (HTTP/HTTPS) request inspection. DDoS attacks can also target the network layer, transport layer, and DNS infrastructure. Full protection requires Shield + WAF + CloudFront + ALB + monitoring — not WAF alone.
+</Accordion>
+
+<Accordion title="Mistake: 'Route 53 blocks DDoS requests'">
+  Route 53 provides highly available DNS resolution and routing capabilities. It is not a request-filtering layer. AWS Shield and AWS WAF provide the DDoS mitigation and application-layer protection.
+</Accordion>
+
+<Accordion title="Mistake: 'Block every IP sending more than 100 requests'">
+  A single corporate NAT gateway can represent thousands of legitimate users. An aggressive global threshold causes false positives and blocks real customers. Base thresholds on measured application behavior, and use scope-down statements to apply strict limits only to high-risk endpoints like `/login` or `/payment`.
+</Accordion>
+
+<Accordion title="Mistake: 'Shield Advanced is free / Shield Standard must be enabled'">
+  Shield Standard is automatically active for eligible AWS services at no extra charge. Shield Advanced is a separately purchased service with additional capabilities and cost. Evaluate Shield Advanced based on your business criticality, availability requirements, and attack risk profile.
+</Accordion>
+
+<Accordion title="Mistake: 'Just protect EC2 — that's enough'">
+  Even if EC2 scales successfully, an unfiltered attack can saturate RDS connections, Redis cache, Elasticsearch, message queues, and third-party APIs. Apply rate limiting specifically to requests that trigger expensive backend operations, and consider queuing mechanisms for high-cost endpoints like report generation or batch processing.
+</Accordion>

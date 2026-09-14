@@ -1,0 +1,69 @@
+---
+title: "AWS Production Knowledge Base: Architecture to Incident Response"
+sidebarTitle: "Introduction"
+description: "Explore real-world AWS production knowledge covering 3-tier architecture, VPC design, IAM security, DDoS protection, region selection, and incident runbooks."
+---
+
+This section documents real production patterns, failure scenarios, and architectural decisions for AWS environments. Every topic is grounded in what actually happens when you run workloads at scale — from the initial choice of an AWS Region, to designing fault-tolerant VPCs, to recovering from a corrupted S3 bucket at 2 AM. Whether you are preparing for a cloud architecture interview or troubleshooting a live incident, these pages give you both the conceptual foundations and the operational detail to act with confidence.
+
+## What This Section Covers
+
+The AWS knowledge base is organized around the full lifecycle of a production environment: design, security hardening, and incident response. Key AWS services referenced throughout include Route 53, CloudFront, WAF, Application Load Balancer, EC2 Auto Scaling Groups, Aurora/RDS, ElastiCache (Redis), S3, IAM, AWS KMS, Systems Manager, CloudWatch, CloudTrail, and AWS Shield.
+
+<CardGroup cols={2}>
+  <Card title="3-Tier Architecture" icon="layer-group" href="/aws/3-tier-architecture">
+    Complete guide to the presentation, application, and data tiers on AWS — including the full Route 53 → CloudFront → WAF → ALB → EC2 → Aurora/Redis request flow.
+  </Card>
+  <Card title="Monolithic vs. Microservices" icon="code-branch" href="/aws/monolithic-vs-microservices">
+    Understand when to choose a monolith versus microservices on AWS, with deployment patterns, scaling trade-offs, and interview-ready explanations.
+  </Card>
+  <Card title="Region Selection" icon="globe" href="/aws/region-selection">
+    A six-factor framework for choosing the right AWS Region — covering latency, compliance, service availability, cost, disaster recovery, and existing integrations.
+  </Card>
+  <Card title="VPC Guide" icon="network-wired" href="/aws/vpc-guide">
+    Production VPC design from CIDR planning through public/private subnet separation, Internet Gateway vs. NAT Gateway, security groups, NACLs, and multi-AZ layout.
+  </Card>
+  <Card title="IAM & Security" icon="shield-halved" href="/aws/iam-authentication-authorization">
+    Authentication vs. authorization in AWS IAM, least-privilege policies, STS temporary credentials, and how to debug AccessDenied errors in production.
+  </Card>
+  <Card title="DDoS Protection" icon="shield" href="/aws/ddos-waf-shield">
+    Layered DDoS defense using AWS Shield, WAF rate-based rules, CloudFront, and ALB — with real traffic-spike scenarios and mitigation runbooks.
+  </Card>
+  <Card title="S3 Recovery" icon="hard-drive" href="/aws/s3-accidental-deletion-recovery">
+    Step-by-step recovery procedures for accidental S3 deletions, using versioning, delete markers, and cross-region replication.
+  </Card>
+  <Card title="Slow App Triage" icon="magnifying-glass-chart" href="/aws/application-slow-troubleshooting">
+    Systematic approach to diagnosing application latency — from Route 53 and ALB through EC2 performance to database slow queries and cache hit rates.
+  </Card>
+</CardGroup>
+
+## How to Use This Section
+
+<Tip>
+Each page is designed to stand alone. If you are debugging a specific production issue, jump directly to the relevant runbook. If you are building a new environment from scratch, start with Region Selection, then VPC Guide, then 3-Tier Architecture.
+</Tip>
+
+The pages follow a consistent structure: a conceptual overview explains *why* a design decision matters, followed by detailed architecture diagrams rendered in text, real command examples drawn directly from production runbooks, and interview-ready summary points. Callout boxes flag common production pitfalls, security anti-patterns, and cost traps.
+
+## Key Design Principles
+
+Every architecture documented in this section is built around five core production goals:
+
+<CardGroup cols={2}>
+  <Card title="High Availability" icon="circle-check">
+    Multi-AZ deployments, Auto Scaling Groups, and ALB health checks ensure traffic continues flowing when individual components fail.
+  </Card>
+  <Card title="Least-Privilege Security" icon="lock">
+    IAM roles instead of access keys, private subnets for compute and databases, security groups scoped to the previous tier, and encrypted data at rest and in transit.
+  </Card>
+  <Card title="Observability" icon="chart-line">
+    CloudWatch metrics, structured application logs, CloudTrail API auditing, and alarms on 5xx rates, latency, and capacity — so you know before your users do.
+  </Card>
+  <Card title="Tested Recovery" icon="rotate">
+    Defined RPO and RTO targets, automated backups, cross-region replication where required, and runbooks that have actually been executed — not just written.
+  </Card>
+</CardGroup>
+
+<Note>
+All architecture examples in this section reflect real-world production patterns. Commands and configuration snippets are taken directly from operational runbooks — nothing is invented for illustration purposes.
+</Note>

@@ -1,0 +1,418 @@
+---
+title: "Pod Running but Unreachable: Production Troubleshooting Guide"
+sidebarTitle: "Pod Not Accessible"
+description: "Debug Kubernetes pods that show Running status but are unreachable, covering service selectors, endpoints, readiness probes, NetworkPolicy, and Ingress routing."
+---
+
+One of the most disorienting production incidents in Kubernetes is a pod that reports `Running` but serves no traffic — users experience timeouts, 502 errors, or connection refused, while `kubectl get pods` looks perfectly healthy. The root cause is almost never the pod itself. Traffic must successfully traverse every hop in a multi-layer path before a user receives a response, and a failure at any single layer produces the same symptom: the application appears down. This guide teaches you to follow that path systematically, validate each layer, and find the break without guessing.
+
+<Warning>
+**The most important rule in Kubernetes availability troubleshooting:**
+
+```text
+Running   ≠ Ready
+Ready     ≠ Reachable
+Reachable ≠ Healthy
+```
+
+A pod showing `1/1 Running` only tells you the container process is alive. It says nothing about whether the application is listening, responding, or reachable from outside the pod.
+</Warning>
+
+## Common Symptoms
+
+When a pod is running but unreachable, users typically see one or more of these:
+
+- **Connection timeout** — traffic is being dropped or the path is broken
+- **Connection refused** — something actively rejected the connection (wrong port, app not listening)
+- **HTTP 502 Bad Gateway** — proxy received an invalid response from the upstream
+- **HTTP 503 Service Unavailable** — no healthy backend is available
+- **HTTP 504 Gateway Timeout** — proxy timed out waiting for a response
+- **DNS resolution errors** — the hostname does not resolve
+- **Intermittent failures** — some requests succeed, pointing to partial readiness
+
+---
+
+## The Complete Traffic Path
+
+Every user request must pass through every layer below. A failure at any layer produces "not accessible" at the top.
+
+<Tabs>
+  <Tab title="External Traffic (Internet → App)">
+    ```text
+    Internet / User
+          |
+          v
+    DNS Resolution
+          |
+          v
+    External Load Balancer
+          |
+          v
+    Ingress Controller
+          |
+          v
+    Kubernetes Service
+          |
+    Service Port (e.g., 80)
+          |
+    targetPort (e.g., 8080)
+          |
+          v
+    Pod (must be Ready)
+          |
+    Container Port (e.g., 8080)
+          |
+          v
+    Application (must bind 0.0.0.0)
+    ```
+  </Tab>
+  <Tab title="Internal Traffic (Pod → Service)">
+    ```text
+    Client Pod
+          |
+          v
+    DNS (CoreDNS resolves service name)
+          |
+          v
+    Kubernetes Service (ClusterIP)
+          |
+    Service Port
+          |
+    targetPort
+          |
+          v
+    Backend Pod (must be Ready)
+          |
+          v
+    Application
+    ```
+  </Tab>
+</Tabs>
+
+Troubleshoot from the **inside out** — validate the application first, then work outward toward the client.
+
+---
+
+## Step-by-Step Debugging Workflow
+
+<Steps>
+  <Step title="Check pod status and readiness">
+    Start with the `READY` column, not just `STATUS`. A pod can be `Running` but not `Ready`:
+
+    ```bash
+    kubectl get pods -o wide
+    ```
+
+    Example of a pod that is running but not ready:
+
+    ```text
+    NAME                    READY   STATUS    RESTARTS   AGE
+    payment-api-7d9f...     0/1     Running   0          20m
+    ```
+
+    `0/1` in the `READY` column means Kubernetes has removed this pod from all Service backends. Dig into conditions and events:
+
+    ```bash
+    kubectl describe pod <pod-name>
+    ```
+
+    Check the `Conditions` block for `Ready: False` and the `Events` section for probe failures.
+  </Step>
+
+  <Step title="Check application logs">
+    If the container is running, logs may reveal why the app is not serving traffic:
+
+    ```bash
+    kubectl logs <pod-name>
+    kubectl logs <pod-name> --since=10m
+    kubectl logs <pod-name> --previous
+    ```
+
+    Look for: startup errors, port binding failures, database connection errors, missing environment variables, dependency failures, and authentication errors.
+  </Step>
+
+  <Step title="Verify the application port and bind address">
+    This is one of the most common and easily missed production issues. Enter the pod and check what the application is actually listening on:
+
+    ```bash
+    kubectl exec -it <pod-name> -- sh
+    ```
+
+    Then inside the container:
+
+    ```bash
+    ss -lntp
+    ```
+
+    or:
+
+    ```bash
+    netstat -lntp
+    ```
+
+    **Good — reachable from outside the pod:**
+    ```text
+    LISTEN  0  128  0.0.0.0:8080
+    ```
+
+    **Bad — only reachable on loopback, invisible to Kubernetes networking:**
+    ```text
+    LISTEN  0  128  127.0.0.1:8080
+    ```
+
+    An application bound to `127.0.0.1` cannot receive traffic routed through the pod IP — it only accepts connections from within the pod itself.
+  </Step>
+
+  <Step title="Test the application from inside the pod">
+    Before checking any Kubernetes objects, confirm the application responds locally:
+
+    ```bash
+    kubectl exec -it <pod-name> -- sh
+    curl localhost:8080
+    curl localhost:8080/health
+    ```
+
+    **If this fails:** the problem is the application itself — startup, port, bind address, or process health.
+
+    **If this succeeds:** the application is healthy. The problem is somewhere in the Kubernetes networking path. Continue outward.
+  </Step>
+
+  <Step title="Inspect the Kubernetes Service">
+    Verify the Service configuration — specifically `targetPort` and the selector:
+
+    ```bash
+    kubectl get svc
+    kubectl describe svc <service-name>
+    kubectl get svc <service-name> -o yaml
+    ```
+
+    Pay attention to the port mapping:
+
+    ```yaml
+    spec:
+      ports:
+        - port: 80         # Service port (what clients connect to)
+          targetPort: 8080 # Pod port (where traffic is delivered)
+    ```
+
+    A wrong `targetPort` sends traffic to a port the application is not listening on. The traffic path becomes:
+
+    ```text
+    Service:80 → Pod:9090 (wrong) → Connection refused
+    ```
+
+    instead of:
+
+    ```text
+    Service:80 → Pod:8080 (correct) → Application responds
+    ```
+  </Step>
+
+  <Step title="Verify Service selector matches pod labels">
+    Label selector mismatches are one of the most common root causes. The Service selector must exactly match the pod labels — a single character difference causes zero traffic.
+
+    ```bash
+    kubectl get pod <pod-name> --show-labels
+    kubectl describe svc <service-name>
+    ```
+
+    **Pod labels:**
+    ```yaml
+    metadata:
+      labels:
+        app: payment-api
+    ```
+
+    **Service selector:**
+    ```yaml
+    spec:
+      selector:
+        app: payment-api   # must match exactly
+    ```
+
+    If the Service says `app: payments-api` and the pod says `app: payment-api`, no traffic is routed. The Service will have no endpoints.
+  </Step>
+
+  <Step title="Check Service endpoints">
+    This is the single fastest way to confirm a selector mismatch or readiness problem. If a Service has no endpoints, it has no pods to send traffic to:
+
+    ```bash
+    kubectl get endpoints <service-name>
+    kubectl get endpointslice
+    ```
+
+    **Healthy — endpoints exist:**
+    ```text
+    NAME           ENDPOINTS
+    payment-api    10.244.1.25:8080,10.244.2.31:8080
+    ```
+
+    **Problem — no endpoints:**
+    ```text
+    NAME           ENDPOINTS
+    payment-api    <none>
+    ```
+
+    No endpoints means: investigate the Service selector, pod labels, and pod readiness.
+  </Step>
+
+  <Step title="Check readiness probes">
+    If the readiness probe fails, Kubernetes keeps the pod `Running` but removes it from all Service backends. The application process is alive — traffic is intentionally withheld.
+
+    ```bash
+    kubectl describe pod <pod-name>
+    ```
+
+    Look for readiness probe failures in Events:
+
+    ```text
+    Readiness probe failed:
+    HTTP probe failed with statuscode: 503
+    ```
+
+    A common configuration error is a mismatched path or port in the probe:
+
+    ```yaml
+    readinessProbe:
+      httpGet:
+        path: /health     # application must respond 200 here
+        port: 8080        # must match the actual listening port
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    ```
+
+    Readiness failures are especially common during: initial startup, rolling deployments, dependency outages, and database migrations.
+  </Step>
+
+  <Step title="Test the Service from inside the cluster">
+    Do not rely solely on external testing. Spin up a debug pod and test the Service directly from within the cluster to isolate whether the problem is internal or external:
+
+    ```bash
+    kubectl run network-debug \
+      --rm -it \
+      --image=curlimages/curl \
+      -- sh
+    ```
+
+    Then:
+
+    ```bash
+    curl http://<service-name>:<service-port>
+    curl http://<cluster-ip>:80
+    ```
+
+    ```text
+    Curl Pod IP directly → FAIL? → Pod/application/network issue
+    Curl Pod IP directly → SUCCESS, curl Service → FAIL? → Service/endpoints/NetworkPolicy
+    Curl Service → SUCCESS, external fails? → Ingress/LB/DNS/TLS issue
+    ```
+  </Step>
+
+  <Step title="Check NetworkPolicies">
+    Even with a healthy pod, ready endpoints, and a correct Service, a NetworkPolicy can silently block all traffic. Check both ingress (traffic to the pod) and egress (traffic from the pod to dependencies):
+
+    ```bash
+    kubectl get networkpolicy
+    kubectl describe networkpolicy <policy-name>
+    ```
+
+    Verify that the policy allows:
+    - Traffic from the Ingress controller to the pod
+    - Traffic from other pods/namespaces that need to reach this service
+    - Egress from the pod to its dependencies (database, Redis, external APIs)
+  </Step>
+
+  <Step title="Check Ingress configuration">
+    If internal Service access works but external access fails, the problem is in the Ingress, Load Balancer, DNS, or TLS layer:
+
+    ```bash
+    kubectl get ingress
+    kubectl describe ingress <ingress-name>
+    ```
+
+    Verify host, path, backend Service name, backend Service port, TLS configuration, and Ingress class. A wrong backend port here produces HTTP 502 or 503 errors even when the Service and pods are perfectly healthy.
+  </Step>
+
+  <Step title="Check recent deployment changes">
+    Production incidents often happen immediately after a deployment. Review what changed:
+
+    ```bash
+    kubectl rollout history deployment/<deployment-name>
+    kubectl describe deployment <deployment-name>
+    ```
+
+    Look for changes to: container image, environment variables, ports, probe paths, Service selectors, ConfigMaps, or resource limits.
+  </Step>
+</Steps>
+
+---
+
+## Root Cause Reference
+
+<Accordion title="App bound to 127.0.0.1 instead of 0.0.0.0">
+The application is listening only on the loopback interface. Traffic routed through the pod IP is dropped. Fix the application startup configuration to bind to `0.0.0.0` (all interfaces) or the specific pod IP.
+</Accordion>
+
+<Accordion title="Service selector labels mismatch">
+The Service `selector` does not match the pod `labels`. The Service has `<none>` endpoints. Fix by aligning the label key/value exactly, or update the Service selector to match the existing pod labels.
+</Accordion>
+
+<Accordion title="No endpoints registered">
+Both selector mismatch and readiness probe failure result in empty endpoints. Check `kubectl get endpoints <service-name>`. If empty, verify labels first, then check readiness probe status on each pod.
+</Accordion>
+
+<Accordion title="Wrong targetPort in Service">
+The Service forwards traffic to a port the application is not listening on. Connection is refused at the pod level. Align `targetPort` in the Service with the actual port the application binds to.
+</Accordion>
+
+<Accordion title="Readiness probe failing">
+The application process is running but its readiness endpoint returns non-200 or times out. Pod is `Running` but `0/1` — removed from Service backends. Fix the health endpoint, probe path, probe port, or the underlying dependency that makes the app report unhealthy.
+</Accordion>
+
+<Accordion title="NetworkPolicy blocking traffic">
+A NetworkPolicy denies ingress to the pod or egress to a dependency. The pod appears healthy but traffic is silently dropped. Inspect all NetworkPolicies in the namespace and verify both ingress and egress rules allow the required traffic paths.
+</Accordion>
+
+<Accordion title="Ingress routing rules incorrect">
+The Ingress host, path, or backend Service reference is wrong. Direct Service access works but external access returns 404, 502, or 503. Fix the Ingress backend `service.name` or `service.port` to match the actual Service.
+</Accordion>
+
+<Accordion title="Overloaded application">
+All pods are Running and Ready, but the application is under too much load to respond in time. Results in 504 timeouts or intermittent failures. Check `kubectl top pod` for CPU/memory pressure, look for `OOMKilled` in `kubectl describe pod`, and review application metrics for saturation.
+</Accordion>
+
+---
+
+## HTTP Error Code Reference
+
+| Status Code | Common Causes in Kubernetes |
+|---|---|
+| **502 Bad Gateway** | Ingress received invalid response — check backend pod health, targetPort, application bind address |
+| **503 Service Unavailable** | No ready endpoints — check readiness probes, Service selector, pod labels |
+| **504 Gateway Timeout** | Application too slow to respond — check resource pressure, dependency latency, LB timeout settings |
+| **Connection Refused** | Wrong port or app not listening — check targetPort and application bind address |
+| **Connection Timeout** | NetworkPolicy, firewall, or routing issue — check NetworkPolicy and security group rules |
+
+---
+
+## Production Incident Quick Checklist
+
+```text
+[ ] Pod is Running
+[ ] Pod is Ready (READY column shows N/N, not 0/N)
+[ ] No unexpected restarts
+[ ] Application logs show no errors
+[ ] Application listens on 0.0.0.0 (not 127.0.0.1)
+[ ] localhost curl inside pod returns 200
+[ ] Service port and targetPort are correct
+[ ] Service selector matches pod labels exactly
+[ ] kubectl get endpoints shows pod IPs (not <none>)
+[ ] Readiness probe path and port are correct
+[ ] Service reachable from debug pod inside cluster
+[ ] NetworkPolicy allows ingress traffic to pod
+[ ] NetworkPolicy allows egress to dependencies
+[ ] Ingress host, path, and backend Service are correct
+[ ] DNS resolves to correct IP
+[ ] Load Balancer health checks pass
+[ ] No recent broken deployment or config change
+```

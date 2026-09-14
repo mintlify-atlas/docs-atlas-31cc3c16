@@ -1,0 +1,364 @@
+---
+title: "Kubernetes PodDisruptionBudget: Safe Node Maintenance in Production"
+sidebarTitle: "PodDisruptionBudget"
+description: "Understand PodDisruptionBudgets in Kubernetes: how they block node drains, eviction math with minAvailable, and best practices for safe production maintenance."
+---
+
+Planned node maintenance is a routine operation in any Kubernetes cluster — node upgrades, instance replacement, and infrastructure patching all require draining pods from nodes. But in production, draining a node without care can violate application availability requirements, briefly dropping below the minimum number of healthy replicas needed to serve traffic. The `PodDisruptionBudget` (PDB) is the Kubernetes mechanism that prevents this. It defines how many pods from a given application may be voluntarily disrupted at one time, and causes `kubectl drain` to pause or block eviction requests when the budget has been exhausted. Understanding how PDB math works is essential for anyone running or maintaining production Kubernetes clusters.
+
+## What Is a PodDisruptionBudget?
+
+A **PodDisruptionBudget** is a Kubernetes policy object that limits how many pods from a selected application can be voluntarily disrupted simultaneously. It protects application availability during planned maintenance by integrating directly with the Kubernetes **Eviction API** — the same API used by `kubectl drain`.
+
+In simple terms:
+
+> **PDB protects application availability during planned (voluntary) disruptions.**
+
+Examples of voluntary disruptions that PDB governs:
+
+- `kubectl drain` for node maintenance
+- Cluster or node upgrades
+- Planned infrastructure replacement
+- Any operation that uses the Eviction API
+
+<Warning>
+A PDB only applies to **voluntary disruptions** — planned events initiated through the Eviction API. If a node crashes unexpectedly (hardware failure, network partition, power loss), the PDB cannot prevent pods from becoming unavailable. PDB is not a high-availability guarantee against involuntary failures — that responsibility belongs to your replica count, pod anti-affinity, and multi-zone topology configuration.
+</Warning>
+
+---
+
+## The Production Scenario
+
+Consider a production application with 6 replicas. All 6 pods are healthy and `Ready`. The infrastructure team needs to perform planned maintenance on a node — they run `kubectl drain`, Kubernetes attempts to evict the pods on that node, and the eviction is **blocked**.
+
+```text
+Application: 6 healthy pods
+        +
+Node drain initiated
+        +
+Eviction request sent
+        ↓
+     BLOCKED
+```
+
+The pods themselves are completely healthy. The **disruption policy** is what is preventing the eviction. This is not a bug — it is PDB working exactly as designed.
+
+---
+
+## PDB Configuration
+
+A PDB uses three key fields:
+
+- **`selector`** — identifies which pods the budget protects (using label selectors)
+- **`minAvailable`** — the minimum number of selected pods that must remain available after a disruption
+- **`maxUnavailable`** — the maximum number of selected pods that may be unavailable due to a disruption
+
+Use **one of `minAvailable` or `maxUnavailable`** — not both.
+
+### Example: minAvailable
+
+This is the PDB from the production scenario — 6 replicas, requiring at least 5 to remain available:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 5
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+### Example: maxUnavailable
+
+Instead of specifying a minimum, you can specify the maximum number (or percentage) that may be unavailable:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+Percentages are also valid:
+
+```yaml
+maxUnavailable: 25%
+```
+
+### minAvailable vs maxUnavailable Comparison
+
+| Configuration | Meaning for 6-replica app |
+|---|---|
+| `minAvailable: 5` | At least 5 pods must remain available — allows 1 disruption |
+| `maxUnavailable: 1` | At most 1 pod may be unavailable — allows 1 disruption |
+| `minAvailable: 80%` | At least 80% (≈5 of 6) must remain available |
+| `maxUnavailable: 20%` | At most 20% (≈1 of 6) may be unavailable |
+| `minAvailable: 6` | All 6 must remain — **zero disruptions allowed** |
+| `maxUnavailable: 0` | Zero may be unavailable — **zero disruptions allowed** |
+
+<Tip>
+`maxUnavailable` as a percentage adapts automatically as you scale replicas up or down. `minAvailable` as a fixed integer requires manual review when replica counts change significantly.
+</Tip>
+
+---
+
+## The Selector Is Critical
+
+The PDB must correctly identify which pods it protects. If the selector does not match the intended pods, the PDB either does nothing or protects the wrong workload.
+
+```yaml
+selector:
+  matchLabels:
+    app: my-app
+```
+
+The targeted pods must carry this label:
+
+```yaml
+metadata:
+  labels:
+    app: my-app
+```
+
+```text
+PDB
+ |
+ | selector: app=my-app
+ ↓
+Pods with app=my-app
+ |
+ ├── Pod 1
+ ├── Pod 2
+ ├── Pod 3
+ ├── Pod 4
+ ├── Pod 5
+ └── Pod 6
+```
+
+Always verify after creating a PDB:
+
+```bash
+kubectl get pods -n <namespace> --show-labels
+```
+
+---
+
+## How Node Drain Interacts With PDB
+
+<Steps>
+  <Step title="Node drain is initiated">
+    An operator or automated system runs `kubectl drain` on a node:
+
+    ```bash
+    kubectl drain <node-name> --ignore-daemonsets
+    ```
+
+    Kubernetes begins evicting each pod from the node using the Eviction API.
+  </Step>
+
+  <Step title="Kubernetes checks the PDB before each eviction">
+    Before evicting any pod, Kubernetes evaluates the PDB for that pod's matching workload:
+
+    ```text
+    kubectl drain
+         |
+         ↓
+    Eviction request
+         |
+         ↓
+    Check PDB: disruptionsAllowed?
+         |
+         ├── YES → Evict pod, decrement budget
+         |
+         └── NO  → Eviction rejected, drain waits
+    ```
+  </Step>
+
+  <Step title="First eviction — budget allows it">
+    Initial state: 6 healthy pods, `minAvailable: 5`.
+
+    ```text
+    currentHealthy:     6
+    desiredHealthy:     5
+    disruptionsAllowed: 1
+    ```
+
+    One disruption is allowed. The eviction proceeds. One pod is evicted from the node — a replacement starts on another node.
+
+    ```text
+    🟢 🟢 🟢 🟢 🟢 🟢  →  🟢 🟢 🟢 🟢 🟢 ❌
+    ```
+  </Step>
+
+  <Step title="Second eviction attempt — budget exhausted">
+    After the first eviction, if the replacement pod has not yet started:
+
+    ```text
+    currentHealthy:     5
+    desiredHealthy:     5
+    disruptionsAllowed: 0
+    ```
+
+    The budget is now zero. A second eviction would drop healthy pods below `minAvailable: 5`. Kubernetes rejects the eviction request. The drain pauses and retries.
+
+    ```text
+    Evict another → healthy = 4 → violates minAvailable = 5 → BLOCKED
+    ```
+  </Step>
+
+  <Step title="Replacement pod becomes Ready — budget restores">
+    Once the replacement pod starts and its readiness probe passes, `currentHealthy` returns to 6:
+
+    ```text
+    currentHealthy:     6
+    desiredHealthy:     5
+    disruptionsAllowed: 1
+    ```
+
+    The drain resumes and the next eviction is processed. This cycle continues until all pods are drained from the node.
+  </Step>
+</Steps>
+
+---
+
+## Troubleshooting a Blocked Eviction
+
+When a node drain appears stuck or a pod eviction is blocked, follow this sequence:
+
+```bash title="Step 1: Check PDB status in the namespace"
+kubectl get pdb -n <namespace>
+```
+
+The most important column in the output is `ALLOWED DISRUPTIONS`. If it shows `0`, eviction is blocked.
+
+```bash title="Step 2: Describe the PDB for full details"
+kubectl describe pdb <pdb-name> -n <namespace>
+```
+
+Check: selector, min available, current healthy, desired healthy, allowed disruptions, and events.
+
+```bash title="Step 3: View the full PDB YAML including status"
+kubectl get pdb <pdb-name> -n <namespace> -o yaml
+```
+
+A healthy PDB status showing one disruption allowed:
+
+```yaml
+status:
+  currentHealthy: 6
+  desiredHealthy: 5
+  disruptionsAllowed: 1
+  expectedPods: 6
+```
+
+A PDB status where eviction is blocked:
+
+```yaml
+status:
+  currentHealthy: 5
+  desiredHealthy: 5
+  disruptionsAllowed: 0
+  expectedPods: 6
+```
+
+The application is already at its minimum required healthy count — one more eviction would violate the budget, so Kubernetes blocks it until `currentHealthy` recovers.
+
+```bash title="Check pod readiness — is the replacement pod Ready?"
+kubectl get pods -n <namespace>
+```
+
+```bash title="Check that PDB selector matches intended pods"
+kubectl get pods -n <namespace> --show-labels
+```
+
+---
+
+## Best Practices for PDB in Production
+
+<Accordion title="Never set minAvailable equal to your total replica count">
+Setting `minAvailable: 6` on a 6-replica deployment means zero pods can ever be evicted voluntarily. Node drains become impossible for any node hosting one of those pods. Always allow at least one disruption — set `minAvailable` to replicas minus 1, or use `maxUnavailable: 1`.
+</Accordion>
+
+<Accordion title="Use maxUnavailable with percentages for auto-scaling workloads">
+When your deployment scales dynamically, a fixed `minAvailable: 5` can become overly restrictive at lower replica counts or too permissive at higher ones. Use `maxUnavailable: 20%` so the budget scales with replica count automatically.
+</Accordion>
+
+<Accordion title="Always verify the selector after creating a PDB">
+A PDB with a selector that matches zero pods does nothing. Run `kubectl get pdb -n <namespace>` and verify `EXPECTED PODS` is greater than zero. If it shows 0, the selector is not matching any pods.
+</Accordion>
+
+<Accordion title="PDB is not the same as Deployment rollingUpdate strategy">
+These two settings are often confused:
+
+```yaml
+# PDB — controls voluntary disruptions during maintenance
+spec:
+  maxUnavailable: 1
+
+# Deployment rollingUpdate — controls how new versions replace old ones
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
+```
+
+They serve entirely different purposes and are evaluated independently. A PDB does not affect rolling deployments; a rolling update strategy does not affect node drains.
+</Accordion>
+
+<Accordion title="For single-replica deployments, PDB still matters">
+A `minAvailable: 1` PDB on a single-replica deployment means the pod can never be evicted during a drain — you must scale to at least 2 replicas before maintenance. Design production workloads with multiple replicas so disruptions can be absorbed.
+</Accordion>
+
+<Accordion title="Advanced: unhealthyPodEvictionPolicy">
+Modern Kubernetes supports an `unhealthyPodEvictionPolicy` field:
+
+```yaml
+spec:
+  minAvailable: 5
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+`AlwaysAllow` permits eviction of pods that are already unhealthy (failing readiness probes), preventing a misbehaving application from blocking node drains indefinitely. The default (`IfHealthyBudget`) only considers healthy pods when calculating the budget.
+</Accordion>
+
+---
+
+## PDB Mental Model
+
+```text
+Application
+    |
+    | 6 replicas
+    ↓
+Pod Pod Pod Pod Pod Pod
+    |
+    ↓
+   PDB (minAvailable: 5)
+    |
+    ├── Planned disruption (kubectl drain)?
+    |        |
+    |        ↓
+    |   disruptionsAllowed > 0?
+    |        |
+    |        ├── YES → Evict pod
+    |        └── NO  → Wait for recovery
+    |
+    └── Node crashes unexpectedly?
+             |
+             ↓
+        PDB cannot prevent this
+```
+
+> **One-line rule:** Healthy pods + blocked eviction = check the PodDisruptionBudget and specifically `disruptionsAllowed`.

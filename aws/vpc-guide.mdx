@@ -1,0 +1,484 @@
+---
+title: "AWS VPC Production Design: Subnets, Gateways & Security"
+sidebarTitle: "VPC Guide"
+description: "Production AWS VPC design guide covering CIDR planning, public and private subnets, Internet Gateway, NAT Gateway, route tables, security groups, NACLs, and multi-AZ layout."
+---
+
+A Virtual Private Cloud (VPC) is the network foundation of every AWS production environment. Before you launch an EC2 instance, configure an ALB, or deploy a database, the VPC defines the IP address space, the subnet topology, the routing rules, and the network security controls that govern all traffic flows. Getting VPC design right from the start is critical — overlapping CIDR blocks, single-AZ deployments, and misconfigured route tables are among the most common and most expensive mistakes in production AWS environments.
+
+This guide covers production VPC design from first principles through the complete reference architecture, with interview scenarios, troubleshooting frameworks, and senior-level trade-off analysis drawn from real production runbooks.
+
+---
+
+## Four Core Design Principles
+
+Every production AWS network should be designed around four principles:
+
+<CardGroup cols={2}>
+  <Card title="Isolation" icon="shield">
+    Workloads should not be directly exposed to the internet unless explicitly required. Application servers and databases belong in private subnets.
+  </Card>
+  <Card title="High Availability" icon="circle-check">
+    Distribute critical components across multiple Availability Zones. A single-AZ architecture has a built-in failure point.
+  </Card>
+  <Card title="Controlled Connectivity" icon="network-wired">
+    Explicitly define how traffic enters, leaves, and moves inside the VPC. Route tables, security groups, and NACLs are the tools.
+  </Card>
+  <Card title="Operational Security" icon="lock">
+    Minimize public exposure. Use managed access mechanisms like Systems Manager Session Manager instead of open SSH ports.
+  </Card>
+</CardGroup>
+
+---
+
+## VPC Fundamentals
+
+### What Is a VPC?
+
+An Amazon VPC is a logically isolated virtual network in AWS where you control:
+- IPv4/IPv6 address ranges (CIDR blocks)
+- Subnet layout across Availability Zones
+- Route tables and routing rules
+- Gateway attachments (Internet Gateway, NAT Gateway, VPN Gateway)
+- Network security controls (security groups, NACLs)
+
+```text
+VPC CIDR: 10.0.0.0/16
+```
+
+### CIDR Planning
+
+CIDR (Classless Inter-Domain Routing) defines your IP address space. A `/16` gives you 65,536 addresses to subdivide into subnets.
+
+<Warning>
+**Plan CIDR before connecting networks.** If your VPC CIDR overlaps with your on-premises network, future VPN or Direct Connect connectivity becomes impossible without complex workarounds.
+
+Example of a dangerous overlap:
+```text
+VPC-A     = 10.0.0.0/16
+On-Prem   = 10.0.0.0/16
+```
+These cannot communicate via standard IP routing — the addresses are ambiguous to the routing layer.
+</Warning>
+
+When planning your VPC CIDR, review:
+- Existing VPCs in your AWS account(s)
+- On-premises data center address ranges
+- VPN and Direct Connect partner networks
+- Future VPC peering or Transit Gateway topology
+- Room for subnet growth within each AZ
+
+---
+
+## Subnets — Public vs. Private
+
+A subnet is an IP range within a VPC, bound to a single Availability Zone.
+
+```text
+VPC: 10.0.0.0/16
+
+Public Subnets:
+  Public-A:   10.0.1.0/24   (AZ-A)
+  Public-B:   10.0.2.0/24   (AZ-B)
+
+Private Subnets:
+  Private-A:  10.0.11.0/24  (AZ-A)
+  Private-B:  10.0.12.0/24  (AZ-B)
+```
+
+### What Makes a Subnet Public?
+
+<Note>
+This is one of the most common interview mistakes. A subnet is **not** public simply because an Internet Gateway is attached to the VPC. The route table association is what determines public vs. private status.
+</Note>
+
+**A subnet is public when its associated route table contains a route to an Internet Gateway:**
+
+```text
+Public Route Table:
+  Destination    Target
+  10.0.0.0/16    local
+  0.0.0.0/0      igw-xxxxxxxx
+```
+
+A resource in that subnet also needs a public IP address and the right security group rules to actually communicate with the internet.
+
+### What Makes a Subnet Private?
+
+A private subnet has **no direct route to an Internet Gateway**. It can still access the internet for outbound calls (software updates, API calls) through a NAT Gateway:
+
+```text
+Private Route Table:
+  Destination    Target
+  10.0.0.0/16    local
+  0.0.0.0/0      nat-xxxxxxxx
+```
+
+---
+
+## Internet Gateway (IGW)
+
+The Internet Gateway is the VPC component that enables communication between VPC resources and the public internet.
+
+**Key properties:**
+- Horizontally scaled and highly available — no capacity management needed
+- Attached to a VPC (one IGW per VPC)
+- Does not automatically expose any resource — routing and security controls must also permit traffic
+
+```text
+EC2 (with public IP)
+   ↓
+Public Subnet
+   ↓
+Route Table: 0.0.0.0/0 → IGW
+   ↓
+Internet Gateway
+   ↓
+Internet
+```
+
+<Warning>
+Attaching an IGW to a VPC does NOT make all resources in the VPC publicly accessible. Subnet route tables, resource public addressing, and security groups must all allow the traffic. This is a very common misunderstanding in interviews.
+</Warning>
+
+---
+
+## NAT Gateway
+
+A NAT Gateway allows resources in private subnets to initiate **outbound** connections to the internet without having a public IP address. It does not permit inbound connections from the internet to private resources.
+
+### Typical Traffic Flow
+
+```text
+Private EC2
+   ↓
+Private Route Table: 0.0.0.0/0 → NAT Gateway
+   ↓
+NAT Gateway (deployed in public subnet)
+   ↓
+Public Route Table: 0.0.0.0/0 → IGW
+   ↓
+Internet Gateway
+   ↓
+Internet
+```
+
+### Where Is NAT Gateway Deployed?
+
+NAT Gateway lives in a **public subnet** because it needs a path to the Internet Gateway. Private subnets route their internet-bound traffic *to* the NAT Gateway.
+
+### NAT Gateway vs. NAT Instance
+
+| | NAT Gateway | NAT Instance |
+|---|---|---|
+| Management | AWS-managed | Customer-managed EC2 |
+| Scaling | Automatic | Must be designed manually |
+| Availability | Built-in HA within an AZ | Requires failover design |
+| Patching | Handled by AWS | You are responsible |
+| Use case | Production default | Legacy or specific customization needs |
+
+<Tip>
+For production workloads, always use a managed NAT Gateway unless you have a specific reason requiring a NAT Instance.
+</Tip>
+
+### Multi-AZ NAT Gateway Design
+
+<Tabs>
+  <Tab title="Single NAT (Not Recommended)">
+    ```text
+    AZ-A Private → NAT-A (AZ-A)
+    AZ-B Private → NAT-A (AZ-A)   ← cross-AZ dependency
+    ```
+    **Problem:** If AZ-A fails, AZ-B workloads lose their outbound internet path too. Also generates cross-AZ data transfer charges.
+  </Tab>
+  <Tab title="NAT Per AZ (Recommended)">
+    ```text
+    AZ-A Private → NAT-A (AZ-A)
+    AZ-B Private → NAT-B (AZ-B)
+    ```
+    **Benefits:** AZ failure is contained. No cross-AZ data transfer for NAT traffic. Each AZ is self-sufficient for outbound access.
+
+    **Trade-off:** Higher cost (two NAT Gateways instead of one).
+  </Tab>
+</Tabs>
+
+---
+
+## Route Tables
+
+Route tables contain rules that determine where network traffic is sent. AWS selects the most specific matching route.
+
+**Public route table:**
+```text
+Destination       Target
+10.0.0.0/16       local
+0.0.0.0/0         igw-xxxx
+```
+
+**Private route table (AZ-A):**
+```text
+Destination       Target
+10.0.0.0/16       local
+0.0.0.0/0         nat-xxxx-az-a
+```
+
+**Route specificity — longer prefix wins:**
+```text
+10.0.10.0/24 → specific-target   (wins for traffic to 10.0.10.x)
+0.0.0.0/0    → NAT Gateway       (fallback for everything else)
+```
+
+<Note>
+Separate route tables per AZ for private subnets are a production best practice. This lets AZ-A private subnets route through NAT-A and AZ-B private subnets route through NAT-B, preventing cross-AZ dependencies.
+</Note>
+
+---
+
+## Security Groups vs. Network ACLs
+
+<Tabs>
+  <Tab title="Security Groups">
+    Security Groups are **stateful** virtual firewalls attached to individual resources (EC2 instances, RDS, ALBs, etc.).
+
+    - **Stateful:** Return traffic is automatically allowed; you only define inbound or outbound rules, not both
+    - **Attached to:** ENIs (Elastic Network Interfaces), not subnets
+    - **Rules:** Allow-only (no explicit deny)
+    - **Scope:** Per-resource
+
+    **Production example — layered security groups:**
+    ```text
+    ALB Security Group
+      Inbound: TCP 443 from 0.0.0.0/0
+
+    EC2 Security Group
+      Inbound: TCP 8080 from ALB Security Group
+
+    Database Security Group
+      Inbound: TCP 5432 from EC2 Security Group
+    ```
+
+    This design ensures the database can only receive traffic from the application tier, and the application tier can only receive traffic from the ALB.
+  </Tab>
+  <Tab title="Network ACLs">
+    Network ACLs (NACLs) are **stateless** firewall rules applied at the subnet level.
+
+    - **Stateless:** You must explicitly allow both inbound AND outbound traffic (including ephemeral return ports)
+    - **Applied to:** Subnets (affects all resources in the subnet)
+    - **Rules:** Allow AND deny; processed in order by rule number
+    - **Scope:** Subnet-level
+
+    **When to use NACLs:**
+    - Additional subnet-level defence-in-depth
+    - Blocking specific IP ranges at the subnet boundary
+    - Supplementing security groups for compliance requirements
+
+    **Important:** NACLs are not a replacement for security groups. Use security groups as your primary control mechanism; add NACLs when subnet-level controls are required.
+  </Tab>
+</Tabs>
+
+---
+
+## Multi-AZ Production Layout
+
+A complete multi-AZ VPC layout for an internet-facing application:
+
+```text
+                        Internet
+                           |
+                        Route 53
+                           |
+               Internet-facing ALB
+                     /          \
+                  AZ-A            AZ-B
+         Public Subnet        Public Subnet
+              |                     |
+           NAT-A                 NAT-B
+              |                     |
+         Private Subnet        Private Subnet
+              |                     |
+          EC2/ASG               EC2/ASG
+```
+
+**Routing:**
+
+```text
+Public subnets (both AZs):
+  0.0.0.0/0 → IGW
+
+Private subnet AZ-A:
+  0.0.0.0/0 → NAT-A
+
+Private subnet AZ-B:
+  0.0.0.0/0 → NAT-B
+```
+
+**Security:**
+- ALB Security Group: Allow TCP 443 from the internet
+- EC2 Security Group: Allow application port from ALB Security Group only
+- No public IPs on EC2 instances
+- Administrative access via Systems Manager Session Manager (no inbound SSH)
+
+---
+
+## Reference Architecture Request Flow
+
+<Steps>
+  <Step title="DNS Resolution">
+    User browser queries Route 53 for `www.example.com`. Route 53 returns the ALB DNS name. Note: Route 53 is a DNS service — it is not part of the VPC data plane and does not replace the Internet Gateway.
+  </Step>
+  <Step title="Internet Gateway">
+    The request arrives at the internet-facing ALB through the Internet Gateway attached to the VPC. The ALB is in the public subnet and has the correct route to the IGW.
+  </Step>
+  <Step title="ALB Routes to Private EC2">
+    The ALB health-checks its registered targets in Private Subnet AZ-A and Private Subnet AZ-B, then forwards the request to a healthy EC2 instance. The EC2 instance has no public IP.
+  </Step>
+  <Step title="Application Processes Request">
+    The EC2 application server handles the request. If it needs to call an external API or download a package, that outbound traffic goes through: Private Route Table → NAT-A → Public Subnet Route → IGW → Internet.
+  </Step>
+  <Step title="Response Returns">
+    The response flows back: Private EC2 → ALB → IGW → Internet → User. Return traffic through the NAT Gateway does not require additional configuration because NAT is stateful for outbound-initiated connections.
+  </Step>
+</Steps>
+
+---
+
+## Bastion Host vs. Session Manager
+
+<Tabs>
+  <Tab title="Bastion Host (Traditional)">
+    A bastion host is an EC2 instance in a public subnet used as an SSH jump server to reach private EC2 instances.
+
+    ```text
+    Administrator
+         ↓
+    Bastion (Public Subnet, SSH 22)
+         ↓
+    Private EC2
+    ```
+
+    **If you must use a bastion:**
+    - Restrict inbound SSH to approved source IP ranges only (never `0.0.0.0/0`)
+    - Use strong key-based authentication
+    - Keep the host patched and minimal
+    - Log all administrative sessions
+    - Consider short-lived certificates instead of long-lived keys
+  </Tab>
+  <Tab title="Session Manager (Recommended)">
+    AWS Systems Manager Session Manager provides shell access to managed EC2 instances without requiring any inbound network ports to be open.
+
+    ```text
+    Administrator
+         ↓
+    AWS Systems Manager (via HTTPS outbound from EC2)
+         ↓
+    Private EC2 (no public IP, no inbound SSH rule)
+    ```
+
+    **Advantages:**
+    - No inbound SSH exposure required
+    - Centralized access control via IAM
+    - Full session logging to CloudWatch Logs or S3
+    - No bastion to patch, manage, or secure
+    - Works for instances in fully private subnets
+
+    For modern AWS environments, evaluate Session Manager first before deploying a bastion host.
+  </Tab>
+</Tabs>
+
+---
+
+## Common VPC Interview Questions
+
+<Accordion title="Can a private subnet access the internet?">
+  Yes. A private subnet can use a NAT Gateway for outbound internet connectivity. The private EC2 instance does not need a public IP.
+
+  ```text
+  Private EC2
+     ↓
+  Private Route Table: 0.0.0.0/0 → NAT Gateway
+     ↓
+  NAT Gateway (public subnet)
+     ↓
+  IGW
+     ↓
+  Internet
+  ```
+</Accordion>
+
+<Accordion title="Can the internet initiate connections to an EC2 through NAT Gateway?">
+  No. NAT Gateway handles connections **initiated by private resources** going outbound. It is not a mechanism for accepting unsolicited inbound connections from the internet. For inbound application traffic, use an internet-facing load balancer and keep application servers private.
+</Accordion>
+
+<Accordion title="Why is NAT Gateway placed in a public subnet?">
+  Because the NAT Gateway needs a path to the Internet Gateway. The public subnet has a route `0.0.0.0/0 → IGW`. Private subnets route their internet-bound traffic to the NAT Gateway, which then uses the public subnet's route to reach the IGW.
+</Accordion>
+
+<Accordion title="Is an EC2 with a public IP automatically reachable from the internet?">
+  No. A public IP alone is insufficient. The subnet's route table must point to an Internet Gateway, the security group must allow the inbound traffic, NACLs must not block it, and the application must be listening on the correct port. All layers must permit the traffic simultaneously.
+</Accordion>
+
+<Accordion title="Can a private subnet have a route to 0.0.0.0/0?">
+  Yes, and this is normal. A private subnet with `0.0.0.0/0 → NAT Gateway` is still a private subnet because it has no direct route to an Internet Gateway. The subnet is classified by its IGW reachability, not by whether it has a default route.
+</Accordion>
+
+---
+
+## Key Rules — Quick Reference
+
+```text
+Rule 1: IGW attached to VPC ≠ public subnet
+Rule 2: Public subnet = route to IGW + appropriate addressing + security config
+Rule 3: Private subnet can have outbound internet via NAT Gateway
+Rule 4: NAT Gateway lives in a public subnet
+Rule 5: Application servers should be in private subnets
+Rule 6: Multiple AZs are required for production HA
+Rule 7: Plan CIDRs before connecting networks — overlaps cannot be routed
+Rule 8: Route tables determine where packets go
+Rule 9: Route 53 provides DNS — it does not replace network routing
+Rule 10: Minimize public exposure; prefer managed services
+```
+
+---
+
+## Production VPC Checklist
+
+<Accordion title="Full Production VPC Checklist">
+**Network Design**
+- [ ] CIDR planned and reviewed for overlaps with existing networks
+- [ ] Multiple Availability Zones used for all critical workloads
+- [ ] Public and private subnet separation implemented
+- [ ] Route tables documented with clear intent
+- [ ] NAT Gateway resilience reviewed (per AZ or single with accepted risk)
+
+**Internet Access**
+- [ ] IGW attached to VPC
+- [ ] Public subnet routes to IGW are intentional
+- [ ] Private subnet routes to NAT Gateway per AZ
+- [ ] Outbound internet access minimized (VPC endpoints for AWS services considered)
+
+**Security**
+- [ ] No unnecessary public IPs on EC2 instances
+- [ ] Security groups follow least privilege
+- [ ] Database security groups do not allow `0.0.0.0/0`
+- [ ] SSH not exposed to the internet (Session Manager preferred)
+- [ ] NACLs reviewed where subnet-level controls are required
+
+**Availability**
+- [ ] Workloads distributed across at least two AZs
+- [ ] Load balancing configured for internet-facing workloads
+- [ ] NAT failure scenario reviewed and mitigated
+- [ ] No critical single-AZ dependencies
+
+**Operations**
+- [ ] VPC Flow Logs enabled
+- [ ] CloudWatch monitoring configured
+- [ ] Infrastructure deployed as Code (Terraform / CloudFormation)
+- [ ] Patch strategy defined
+- [ ] Backup and recovery plan tested
+</Accordion>
+
+---
+
+## One-Sentence Interview Answer
+
+> "For a production VPC, I start with non-overlapping CIDR planning, deploy public and private subnets across multiple Availability Zones, keep application workloads private, use an internet-facing load balancer for inbound traffic, NAT Gateway per AZ for controlled outbound access, intentional route tables, least-privilege security groups, and I eliminate every single point of failure before go-live."

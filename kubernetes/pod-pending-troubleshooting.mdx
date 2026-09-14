@@ -1,0 +1,392 @@
+---
+title: "Troubleshooting Kubernetes Pods Stuck in Pending State"
+sidebarTitle: "Pod Pending"
+description: "Diagnose why Kubernetes pods stay Pending using kubectl describe, Events, and a structured decision tree covering resources, affinity, taints, storage, and CNI."
+---
+
+When a Kubernetes pod remains in the `Pending` state after a deployment, it almost always means the **scheduler cannot find a suitable node** to place it on — not that the application is broken. Understanding this distinction saves significant debugging time in production. A `Pending` pod has no assigned node, no running container, and no application logs to examine, so the entire investigation lives at the infrastructure and scheduling layer. This guide walks you through the eight root causes, the most important diagnostic commands, and a structured investigation workflow.
+
+<Warning>
+Do not start with `kubectl logs` when a pod is `Pending`. The container has not started, so application logs do not exist yet. Begin with `kubectl describe pod` and read the **Events** section.
+</Warning>
+
+## The Pending State Explained
+
+A pod enters `Pending` immediately after creation and stays there until Kubernetes can schedule it onto a node. The moment you see `NODE = <none>` in `kubectl get pods -o wide` output, you are dealing with a scheduling problem — not a container, application, or secret problem.
+
+The three categories of pod failure are completely separate:
+
+```text
+Can Kubernetes Schedule the Pod?
+   |
+   +---- NO ----> Pending
+   |                |
+   |                +--> Resources (CPU / Memory)
+   |                +--> Node Selector / Affinity
+   |                +--> Taints / Tolerations
+   |                +--> Pod Affinity / Anti-Affinity
+   |                +--> Topology Spread Constraints
+   |                +--> Storage (PVC not bound)
+   |                +--> CNI / IP Exhaustion
+   |                +--> Cluster Capacity
+   |
+   +---- YES ---> Pod Scheduled
+                    |
+                    +--> Container Starts (Image Pull, Secrets, Config)
+                    +--> Readiness / Liveness Probes
+                    +--> Application Startup
+```
+
+## Key Diagnostic Commands
+
+Start every investigation with pod status, then immediately move to `describe`:
+
+```bash title="Check pod status and node assignment"
+kubectl get pods -n <namespace> -o wide
+```
+
+Example output showing a pod with no assigned node:
+
+```text
+NAME                     READY   STATUS    RESTARTS   AGE   IP       NODE
+payment-api-7d9f8c       0/1     Pending   0          2m    <none>   <none>
+```
+
+The `NODE = <none>` column is the definitive signal that scheduling has not occurred.
+
+```bash title="Describe the pod — most important command"
+kubectl describe pod <pod-name> -n <namespace>
+```
+
+Pay special attention to these fields in the output:
+
+```text
+Node:           (empty if unscheduled)
+Conditions:     PodScheduled = False
+Node-Selectors: (any label constraints)
+Tolerations:    (what taints the pod can tolerate)
+Affinity:       (node and pod affinity rules)
+Events:         (THE most useful section for Pending pods)
+```
+
+### Reading the Events Section
+
+The **Events** section of `kubectl describe pod` is the primary diagnostic source for a `Pending` pod. Kubernetes tells you exactly which scheduling constraints blocked placement:
+
+```text
+Events:
+  Warning  FailedScheduling
+  0/6 nodes are available:
+  3 Insufficient cpu,
+  2 node(s) had untolerated taint,
+  1 node(s) didn't match Pod's node affinity
+```
+
+This single event message reveals three separate blocking reasons across six nodes. Investigate each one.
+
+<Note>
+**Production rule:** Do not guess the root cause. Read the Events and then investigate the specific layer they point to. Events are a diagnostic source, not a separate root-cause category.
+</Note>
+
+---
+
+## Eight Root Causes of Pending Pods
+
+### 1. Insufficient CPU or Memory
+
+Kubernetes scheduling is based on **resource requests**, not current utilization. Even if a node's CPU usage is low, if its allocatable capacity is already reserved by existing pod requests, a new pod cannot be scheduled there.
+
+```bash title="Check node capacity and allocatable resources"
+kubectl describe nodes
+```
+
+```bash title="Check current resource utilization"
+kubectl top nodes
+kubectl top pods -A
+```
+
+```bash title="Inspect the pod's resource requests"
+kubectl get pod <pod-name> -n <namespace> -o yaml
+```
+
+Look for this in the pod YAML:
+
+```yaml
+resources:
+  requests:
+    cpu: "4"
+    memory: "8Gi"
+```
+
+**Typical event:**
+```text
+0/3 nodes are available: 3 Insufficient cpu.
+```
+
+### 2. Node Selector or Required Node Affinity
+
+A pod configured to run only on nodes with specific labels will stay `Pending` if no node carries those labels.
+
+```bash title="List nodes with their labels"
+kubectl get nodes --show-labels
+kubectl get nodes -L workload
+```
+
+Example required node affinity in the pod spec:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: workload
+          operator: In
+          values:
+          - production
+```
+
+**Typical event:**
+```text
+0/5 nodes are available: 5 node(s) didn't match Pod's node affinity/selector.
+```
+
+### 3. Taints and Tolerations
+
+A node taint rejects pods that do not explicitly tolerate it. Check node taints first, then verify the pod has a matching toleration.
+
+```bash title="Check taints on all nodes"
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+```
+
+A toleration must match the taint exactly:
+
+```yaml
+tolerations:
+- key: "dedicated"
+  operator: "Equal"
+  value: "production"
+  effect: "NoSchedule"
+```
+
+<Tip>
+A toleration does **not** force a pod onto a tainted node — it only permits the pod to be scheduled there. All other scheduling constraints still apply.
+</Tip>
+
+**Typical event:**
+```text
+node(s) had untolerated taint
+```
+
+### 4. Pod Affinity and Anti-Affinity
+
+Required pod anti-affinity prevents multiple replicas from landing on the same node. If the cluster does not have enough nodes to spread replicas according to the rule, new pods stay `Pending`.
+
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app: payment-api
+      topologyKey: kubernetes.io/hostname
+```
+
+Check the pod YAML for `affinity.podAffinity` and `affinity.podAntiAffinity` blocks, and verify the `topologyKey` and `labelSelector` are still valid given current cluster topology.
+
+### 5. Topology Spread Constraints
+
+Production workloads use topology spread constraints to distribute pods across availability zones. If `whenUnsatisfiable: DoNotSchedule` is set and the required spread cannot be achieved, the pod stays `Pending`.
+
+```yaml
+topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app: payment-api
+```
+
+```bash title="Check zone distribution of nodes"
+kubectl get nodes \
+  -L topology.kubernetes.io/zone \
+  -L kubernetes.io/hostname
+```
+
+### 6. PersistentVolumeClaim / Storage Problems
+
+A pod requiring a PVC that is not yet bound will stay `Pending`. Volume topology further constrains scheduling — a pod with a volume in `us-east-1a` cannot be placed on a node in `us-east-1b`.
+
+```bash title="Check PVC binding status"
+kubectl get pvc -n <namespace>
+kubectl describe pvc <pvc-name> -n <namespace>
+```
+
+```bash title="Check PersistentVolumes and StorageClasses"
+kubectl get pv
+kubectl get storageclass
+```
+
+**Typical PVC status:**
+```text
+NAME           STATUS    VOLUME
+payment-data   Pending
+```
+
+### 7. Subnet IP Exhaustion / AWS VPC CNI Capacity
+
+In Amazon EKS using the AWS VPC CNI, pods consume VPC IP addresses directly. A cluster can have available CPU and memory but still be unable to schedule pods due to subnet IP exhaustion.
+
+```bash title="Check AWS VPC CNI pod health"
+kubectl get pods -n kube-system -l k8s-app=aws-node
+```
+
+```bash title="Check CNI logs for IP allocation errors"
+kubectl logs -n kube-system \
+  -l k8s-app=aws-node \
+  --tail=100
+```
+
+<Note>
+In high-density EKS clusters, always ask: **"Do I have enough network capacity to place and initialize more pods?"** — not just CPU and memory.
+</Note>
+
+### 8. No Suitable Node / Cluster Capacity
+
+Sometimes the cluster simply has no usable capacity. All nodes are full, have wrong labels, or are tainted in a way incompatible with the pod. If Cluster Autoscaler is configured, check whether the node group has reached its maximum size.
+
+```bash title="Check nodes and resource usage"
+kubectl get nodes
+kubectl top nodes
+kubectl describe node <node-name>
+```
+
+---
+
+## Step-by-Step Investigation Workflow
+
+<Steps>
+  <Step title="Check pod status and node assignment">
+    Run `kubectl get pods -n <namespace> -o wide`. Confirm `STATUS = Pending` and `NODE = <none>`. If a node is assigned, the pod has been scheduled — switch to container/application troubleshooting instead.
+
+    ```bash
+    kubectl get pods -n <namespace> -o wide
+    ```
+  </Step>
+
+  <Step title="Describe the pod and read Events">
+    This is the single most important step for a genuinely `Pending` pod. The Events section will tell you which scheduling constraints blocked placement.
+
+    ```bash
+    kubectl describe pod <pod-name> -n <namespace>
+    ```
+
+    Read the Events section carefully. A message like `0/6 nodes are available: 3 Insufficient cpu, 2 node(s) had untolerated taint` tells you exactly what to fix.
+  </Step>
+
+  <Step title="Check namespace-level events">
+    For broader context, list recent events sorted by timestamp:
+
+    ```bash
+    kubectl get events -n <namespace> --sort-by=.lastTimestamp
+    ```
+  </Step>
+
+  <Step title="Check node capacity and labels">
+    Based on what the Events section reports, inspect nodes for resource availability, labels, and taints:
+
+    ```bash
+    kubectl get nodes
+    kubectl get nodes --show-labels
+    kubectl top nodes
+    kubectl describe nodes
+    ```
+  </Step>
+
+  <Step title="Inspect the pod's full configuration">
+    Review the pod spec for the specific constraint the Events identified:
+
+    ```bash
+    kubectl get pod <pod-name> -n <namespace> -o yaml
+    ```
+
+    Inspect these fields: `resources`, `nodeSelector`, `affinity`, `tolerations`, `topologySpreadConstraints`, `volumes`.
+  </Step>
+
+  <Step title="Check storage if volumes are involved">
+    If the pod uses PVCs, verify their binding status and that volume topology is compatible with available nodes:
+
+    ```bash
+    kubectl get pvc -n <namespace>
+    kubectl get pv
+    kubectl get storageclass
+    kubectl describe pvc <pvc-name> -n <namespace>
+    ```
+  </Step>
+
+  <Step title="Check EKS CNI if IP exhaustion is suspected">
+    In EKS clusters, check the `aws-node` pods and their logs for IP allocation failures:
+
+    ```bash
+    kubectl get pods -n kube-system -l k8s-app=aws-node
+    kubectl logs -n kube-system -l k8s-app=aws-node --tail=100
+    ```
+  </Step>
+
+  <Step title="Fix the root cause and observe">
+    Once the specific scheduling constraint is identified, apply the targeted fix — add node capacity, correct labels, adjust resource requests, fix PVC configuration, or add a toleration. Then watch the pod move out of `Pending`.
+
+    ```bash
+    kubectl get pods -n <namespace> -w
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Quick Reference: Root Cause Lookup Table
+
+<Accordion title="What does each Event message mean?">
+
+| Event Message | Root Cause | Primary Command |
+|---|---|---|
+| `Insufficient cpu` or `Insufficient memory` | Resource requests exceed node allocatable capacity | `kubectl describe nodes` |
+| `didn't match Pod's node affinity/selector` | `nodeSelector` or required `nodeAffinity` has no matching nodes | `kubectl get nodes --show-labels` |
+| `had untolerated taint` | Node taint has no matching toleration in pod spec | `kubectl describe node <name>` |
+| `didn't match pod affinity/anti-affinity` | Pod anti-affinity rule blocks placement given current topology | `kubectl get pod -o yaml` |
+| `didn't satisfy topology spread constraint` | `topologySpreadConstraints` with `DoNotSchedule` cannot be met | `kubectl get nodes -L topology.kubernetes.io/zone` |
+| Unbound PVC / storage issue | PVC in `Pending` or volume topology mismatch | `kubectl describe pvc` |
+| CNI / IP exhaustion | AWS VPC subnet IP addresses exhausted | `kubectl logs -n kube-system -l k8s-app=aws-node` |
+| `0/N nodes are available` (all reasons failed) | Cluster has no node that satisfies all constraints together | `kubectl top nodes`, check autoscaler |
+
+</Accordion>
+
+<Accordion title="When should I use kubectl logs?">
+`kubectl logs` is **not** the right first tool for a `Pending` pod. Use it only once the container has started. The distinction:
+
+- **`Pending`** → investigate with `kubectl describe pod` + Events
+- **`Running 0/1`** → investigate readiness probes and application health with `kubectl describe` and `kubectl logs`
+- **`CrashLoopBackOff`** → investigate with `kubectl logs <pod> --previous`
+- **`ImagePullBackOff`** → investigate with `kubectl describe pod` Events for registry/credential issues
+</Accordion>
+
+---
+
+## Production Mental Model
+
+```text
+See: Pending
+Think: "Can Kubernetes find a suitable place to run this pod?"
+
+See: Running 0/1
+Think: "The pod is running, but is the application ready?"
+
+See: CrashLoopBackOff
+Think: "Why is the container repeatedly crashing?"
+
+See: ImagePullBackOff
+Think: "Why can't the node pull the container image?"
+```
+
+Each pod state requires a **different troubleshooting path**. Never mix scheduling investigation with container or application investigation.

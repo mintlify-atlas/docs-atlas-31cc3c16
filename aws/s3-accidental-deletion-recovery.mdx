@@ -1,0 +1,461 @@
+---
+title: "Recovering from Accidental S3 Deletion in Production"
+sidebarTitle: "S3 Deletion Recovery"
+description: "How to recover deleted S3 objects using versioning and delete markers, investigate root cause via CloudTrail, and prevent future data loss with cross-region replication."
+---
+
+Accidental deletion of a production S3 object is one of the most stressful incidents an engineer faces — especially when the application is already returning HTTP 404 errors and business-critical data appears gone. The good news is that if you prepared ahead of time, recovery can be a matter of minutes. This runbook walks through the full incident lifecycle: immediate containment, version-aware recovery, cross-region fallback, CloudTrail audit, and the hardened architecture that prevents a repeat.
+
+## The Incident Scenario
+
+A developer accidentally runs the following command against a production bucket:
+
+```bash title="Accidental deletion"
+aws s3 rm s3://production-data/invoices/invoice-1001.pdf
+```
+
+The application immediately begins returning:
+
+```text
+HTTP 404 Not Found
+```
+
+Before touching anything in the bucket, answer these six questions:
+
+<CardGroup cols={2}>
+  <Card title="Was versioning enabled?" icon="circle-question">
+    If S3 Versioning was on before the deletion, the object data almost certainly still exists under a previous version ID.
+  </Card>
+  <Card title="Delete Marker or hard delete?" icon="circle-question">
+    A normal `aws s3 rm` with versioning creates a Delete Marker — not a permanent removal. A version-specific delete is permanent.
+  </Card>
+  <Card title="Is there a replica or backup?" icon="circle-question">
+    Cross-Region Replication, AWS Backup, or application-level backups may hold an independent copy regardless of versioning state.
+  </Card>
+  <Card title="Which version do we need?" icon="circle-question">
+    If multiple versions exist, confirm which version ID maps to the correct state before restoring.
+  </Card>
+  <Card title="Who performed the delete?" icon="circle-question">
+    CloudTrail will reveal the IAM role, source IP, and timestamp — critical for the post-incident review.
+  </Card>
+  <Card title="How do we prevent recurrence?" icon="circle-question">
+    IAM least-privilege, Object Lock, MFA Delete, and monitoring are the defence layers to tighten after recovery.
+  </Card>
+</CardGroup>
+
+---
+
+## How S3 Versioning and Delete Markers Work
+
+Understanding the mechanics before touching the bucket is critical. When S3 Versioning is enabled, a plain `aws s3 rm` does **not** permanently erase data — it inserts a **Delete Marker** that hides all previous versions from normal GET and LIST operations.
+
+```text
+Before deletion:
+
+invoice-1001.pdf
+       │
+       ├── Version A  ← older version
+       └── Version B  ← current version
+
+
+After `aws s3 rm` (versioning enabled):
+
+invoice-1001.pdf
+       │
+       ├── Delete Marker  ← new "current" entry (hides everything below)
+       ├── Version B      ← still present, not deleted
+       └── Version A      ← still present, not deleted
+```
+
+<Warning>
+A Delete Marker is **not** the same as permanently deleting an object version. However, issuing a delete **with a specific `--version-id`** permanently removes that version — versioning cannot recover a version that was hard-deleted by its ID.
+</Warning>
+
+This distinction determines which recovery path you follow.
+
+---
+
+## Production Data-Protection Architecture
+
+For business-critical S3 data, a single control is never enough. A mature production design layers multiple mechanisms:
+
+```text
+                     Production Application
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │   S3 Bucket     │
+                     │   Versioning    │
+                     └────────┬────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            │                 │                 │
+            ▼                 ▼                 ▼
+      IAM Controls        CloudTrail        Monitoring
+            │                 │                 │
+            ▼                 ▼                 ▼
+    Restricted Delete     Audit Trail         Alerts
+            │
+            ▼
+    Object Lock
+  (where appropriate)
+            │
+            └──────────────────┐
+                               ▼
+                      Independent Backup
+                               │
+                               ▼
+                      DR / Replication
+```
+
+<Note>
+Versioning protects against accidental deletion and overwrite. It does **not** protect against a privileged user or compromised credential performing a version-specific permanent delete — that requires additional IAM controls, Object Lock, and independent backups.
+</Note>
+
+---
+
+## Step-by-Step Recovery Procedure
+
+<Steps>
+  <Step title="Stop Further Destructive Operations">
+    Before any recovery action, halt all activity that could make the situation worse:
+
+    - Stop any script, deployment, or automation that may have caused the deletion.
+    - Revoke or rotate compromised credentials if the deletion was caused by a breach.
+    - Do **not** perform broad bucket modifications when only one object is affected.
+    - Preserve all evidence — do not clear logs.
+
+    The goal at this stage is to prevent a contained incident from becoming a larger one.
+  </Step>
+
+  <Step title="Identify the Exact Object">
+    Record precise details so that recovery commands target only the affected object:
+
+    ```text
+    Bucket:               production-data
+    Object key:           invoices/invoice-1001.pdf
+    Approximate time:     <timestamp>
+    Application/service:  <service name>
+    Environment:          production
+    Business owner:       <team>
+    ```
+
+    Avoid guessing at keys — an incorrect version-specific delete command permanently destroys data.
+  </Step>
+
+  <Step title="Check Versioning Status">
+    Confirm whether S3 Versioning was active on the bucket **before** the deletion occurred:
+
+    ```bash title="Check bucket versioning"
+    aws s3api get-bucket-versioning \
+      --bucket production-data
+    ```
+
+    Expected response when versioning is enabled:
+
+    ```json
+    {
+      "Status": "Enabled"
+    }
+    ```
+
+    If versioning is **not** enabled, skip ahead to the "No Versioning" tab in the recovery scenarios below.
+  </Step>
+
+  <Step title="List Object Versions and Locate the Delete Marker">
+    If versioning is enabled, list all versions of the affected key:
+
+    ```bash title="List object versions"
+    aws s3api list-object-versions \
+      --bucket production-data \
+      --prefix invoices/invoice-1001.pdf
+    ```
+
+    Look for output like this:
+
+    ```text
+    Versions:
+      VersionId:  v2
+      IsLatest:   false
+      Key:        invoices/invoice-1001.pdf
+
+    DeleteMarkers:
+      VersionId:  d1
+      IsLatest:   true
+      Key:        invoices/invoice-1001.pdf
+    ```
+
+    The Delete Marker version ID (`d1` in this example) is what you will remove. The previous object version (`v2`) is intact and recoverable.
+  </Step>
+
+  <Step title="Execute Recovery (Choose Scenario Below)">
+    Use the appropriate recovery path depending on what the version listing reveals. See the **Recovery Scenarios** section immediately below for the exact commands.
+  </Step>
+
+  <Step title="Validate the Restored Object">
+    After recovery, confirm the object is readable before declaring the incident resolved:
+
+    ```bash title="Verify restored object"
+    aws s3api head-object \
+      --bucket production-data \
+      --key invoices/invoice-1001.pdf
+    ```
+
+    A successful `200 OK` response with content-length and last-modified metadata confirms the object is accessible. Verify that the application also returns a successful response.
+  </Step>
+
+  <Step title="Audit via CloudTrail">
+    Identify the actor responsible for the deletion:
+
+    ```text
+    Events to search:
+      DeleteObject
+      DeleteObjects
+      DeleteObjectVersion
+
+    Details to capture:
+      Who?       IAM user / role / assumed role
+      When?      Event timestamp
+      Bucket?    Bucket name
+      Object?    Object key
+      Account?   AWS account ID
+      IP?        Source IP address
+      Tool?      AWS Console / CLI / SDK / automation
+    ```
+
+    CloudTrail turns "someone deleted a file" into "Role X performed a `DeleteObject` on key Y at time Z from IP A" — which is actionable for both remediation and the post-incident review.
+  </Step>
+
+  <Step title="Close the Incident and Prevent Recurrence">
+    Work through the prevention checklist once the application is healthy. See the **Prevention Checklist** section at the bottom of this page.
+  </Step>
+</Steps>
+
+---
+
+## Recovery Scenarios
+
+<Tabs>
+  <Tab title="Versioning Enabled">
+    **Scenario:** Versioning was active before deletion. The version listing shows a Delete Marker as the current entry and a previous object version beneath it.
+
+    **Action: Remove the Delete Marker**
+
+    Removing the Delete Marker promotes the previous object version back to current status — no data copy is required.
+
+    ```bash title="Remove Delete Marker"
+    aws s3api delete-object \
+      --bucket production-data \
+      --key invoices/invoice-1001.pdf \
+      --version-id <DELETE-MARKER-VERSION-ID>
+    ```
+
+    <Warning>
+    You are deleting **the Delete Marker**, not the object. The `--version-id` flag must point to the Delete Marker's version ID — never to the data version you want to keep.
+    </Warning>
+
+    **Alternative: Restore a specific historical version**
+
+    If the most recent previous version is not the correct one (e.g., the object was overwritten before the accidental delete), download the required version and restore it through a controlled process:
+
+    ```bash title="Download a specific version"
+    aws s3api get-object \
+      --bucket production-data \
+      --key invoices/invoice-1001.pdf \
+      --version-id <VERSION-ID> \
+      restored-invoice-1001.pdf
+    ```
+
+    This approach is also useful when you need to compare historical versions before committing to a restoration target.
+  </Tab>
+
+  <Tab title="Cross-Region Replication">
+    **Scenario:** Versioning was not enabled (or the required version was permanently deleted), but the bucket had Cross-Region Replication configured to a DR bucket in another region.
+
+    ```text
+              Primary Region
+          ┌──────────────────┐
+          │ Production S3    │
+          │ Bucket           │
+          └────────┬─────────┘
+                   │
+              Replication
+                   │
+                   ▼
+          ┌──────────────────┐
+          │ DR S3 Bucket     │
+          │ Other Region     │
+          └──────────────────┘
+    ```
+
+    **Action:** Check the DR bucket for the object, then copy it back to the primary bucket.
+
+    <Warning>
+    Replication is **not** automatically equivalent to a backup. Its behaviour for delete events, overwrites, and versioning depends on your replication configuration. Always validate that the replicated copy matches the expected object before restoring.
+    </Warning>
+
+    Investigate whether the replication configuration propagates delete markers to the destination. If delete-marker replication is enabled, the replica bucket may also show the object as deleted — in that case, check the replica's versioned object list for the underlying data version.
+  </Tab>
+
+  <Tab title="No Versioning or Replication">
+    **Scenario:** Versioning was not enabled and no replication exists. This is the hardest recovery scenario.
+
+    Investigate these independent recovery sources in order of likelihood:
+
+    1. **AWS Backup** — If the S3 bucket was included in an AWS Backup plan, check available recovery points.
+    2. **Application-level backup** — Some applications maintain independent copies of critical documents.
+    3. **Data pipeline / source system** — The original file may still exist in a database, file server, data lake, upload service, or another S3 bucket.
+    4. **Business owner** — For business-critical files, the document owner may have the original source on their system.
+
+    <Note>
+    This scenario is the strongest argument for enabling S3 Versioning and configuring independent backups **before** an incident. The best time to prepare is before the deletion happens.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## AWS CLI Quick Reference
+
+```bash title="Check bucket versioning"
+aws s3api get-bucket-versioning \
+  --bucket production-data
+```
+
+```bash title="List all object versions"
+aws s3api list-object-versions \
+  --bucket production-data \
+  --prefix invoices/invoice-1001.pdf
+```
+
+```bash title="Remove a Delete Marker (restores previous version)"
+aws s3api delete-object \
+  --bucket production-data \
+  --key invoices/invoice-1001.pdf \
+  --version-id <DELETE-MARKER-VERSION-ID>
+```
+
+```bash title="Download a specific object version"
+aws s3api get-object \
+  --bucket production-data \
+  --key invoices/invoice-1001.pdf \
+  --version-id <VERSION-ID> \
+  restored-invoice-1001.pdf
+```
+
+```bash title="Verify the restored object"
+aws s3api head-object \
+  --bucket production-data \
+  --key invoices/invoice-1001.pdf
+```
+
+---
+
+## Prevention Checklist
+
+Work through this checklist after every incident — and proactively for all production buckets that hold important data.
+
+<Accordion title="Enable S3 Versioning on all production buckets">
+  Versioning must be enabled **before** an incident occurs. It is not a time machine for objects that were permanently deleted before versioning was active.
+
+  ```text
+  S3 Bucket → Versioning = Enabled
+  ```
+
+  Once enabled, a plain `aws s3 rm` creates a Delete Marker rather than permanently removing the object — giving you a recovery window.
+</Accordion>
+
+<Accordion title="Apply least-privilege IAM — restrict s3:DeleteObjectVersion">
+  Developers working with production data should not hold `s3:*`. The most dangerous permission to leave ungated is:
+
+  ```text
+  s3:DeleteObjectVersion
+  ```
+
+  This permission allows permanent removal of a retained version, bypassing the protection versioning provides. Separate destructive administrative roles from operational roles. Use IAM policies, permission boundaries, and SCPs to limit who can call version-specific deletes.
+</Accordion>
+
+<Accordion title="Consider S3 Object Lock for compliance and high-value data">
+  For compliance records, financial data, audit logs, and regulatory retention requirements, S3 Object Lock provides WORM-style protection:
+
+  ```text
+  Application
+       │
+       ▼
+  S3 Object
+       │
+       ▼
+  Retention / Legal Hold
+       │
+       ▼
+  Object protected from deletion
+  ```
+
+  Choose the retention mode and duration carefully — Object Lock intentionally makes deletion difficult.
+</Accordion>
+
+<Accordion title="Configure Cross-Region Replication for disaster recovery">
+  Replication to a separate region provides resilience against regional failures and operational mistakes. Design and test the replication behaviour for delete propagation, versioning, and the specific recovery scenario your team needs.
+</Accordion>
+
+<Accordion title="Manage Versioning storage costs with Lifecycle Policies">
+  Versioning causes multiple object versions to accumulate over time. Without lifecycle management, storage costs grow. Configure lifecycle rules for noncurrent versions, expired delete markers, and incomplete multipart uploads — but avoid aggressive expiration policies that shrink your recovery window.
+</Accordion>
+
+<Accordion title="Add monitoring and alerting for destructive operations">
+  Production S3 environments should alert on sensitive activity:
+
+  ```text
+  Unexpected object deletion  →  Alert
+  Large-scale deletion        →  Alert
+  Version deletion            →  Alert
+  Bucket policy changes       →  Alert
+  Public access changes       →  Alert
+  Replication failures        →  Alert
+  ```
+
+  Route CloudTrail events through a detection rule and alert the SRE or security team before a small mistake becomes a large incident.
+</Accordion>
+
+<Accordion title="Test recovery procedures regularly">
+  Having versioning enabled is not sufficient. Periodically verify:
+
+  ```text
+  Can we find the correct version?
+  Can we restore it?
+  Can the application read it?
+  Can we recover within our RTO?
+  ```
+
+  An untested recovery plan is an unknown recovery plan.
+</Accordion>
+
+---
+
+## Common Production Mistakes
+
+<Accordion title="'S3 is durable so deletion is impossible'">
+  Incorrect. S3's eleven-nines durability describes protection against hardware failure — not protection against an authorized `DeleteObject` API call. Durability and deletion-protection are separate concerns.
+</Accordion>
+
+<Accordion title="'Versioning is the same as backup'">
+  Versioning retains previous object versions but it is not an independent backup strategy. A privileged user or compromised credential can permanently delete every retained version using `s3:DeleteObjectVersion`. Versioning must be combined with IAM controls, independent backups, and monitoring.
+</Accordion>
+
+<Accordion title="Giving developers s3:* on production buckets">
+  Broad S3 permissions increase the blast radius of human error, compromised credentials, malicious actions, and incorrect automation. Scope permissions to the minimum required for each role.
+</Accordion>
+
+<Accordion title="Never testing the recovery procedure">
+  Teams often enable versioning and assume recovery will work when needed. Without a tested runbook, the first real incident also becomes a learning exercise — under time pressure.
+</Accordion>
+
+---
+
+## Interview Answer: "A developer deleted a production S3 file. How do you recover it?"
+
+<Tip>
+A strong interview answer demonstrates AWS knowledge, incident response process, security thinking, and disaster recovery awareness — not just the CLI commands.
+
+> "First, I contain the incident — stop any destructive automation, preserve logs, and prevent further deletions. Then I check whether S3 Versioning was enabled before the deletion. If it was, I list the object's versions to see whether the latest entry is a Delete Marker. If a previous version still exists, I restore it by removing the Delete Marker, or by downloading and re-uploading a specific version if the latest one isn't correct. I validate that the application can access the object, then investigate CloudTrail to identify what role or process performed the deletion. Finally, I review IAM permissions (especially `s3:DeleteObjectVersion`), lifecycle policies, replication, monitoring, and our recovery testing cadence so the same incident doesn't happen again."
+</Tip>

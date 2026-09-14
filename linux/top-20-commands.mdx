@@ -1,0 +1,656 @@
+---
+title: "Linux Top 20 Commands for DevOps and Cloud Engineers"
+sidebarTitle: "Top 20 Commands"
+description: "A production DevOps cheatsheet covering the 20 essential Linux commands used daily by SREs and Cloud Engineers on EC2 and Linux servers."
+---
+
+Every DevOps and SRE engineer working on Linux — whether managing EC2 instances, debugging Kubernetes nodes, or responding to production incidents — relies on a core set of commands. This cheatsheet covers all 20 essential Linux commands with real syntax, useful flags, example output, and production use cases specific to cloud and DevOps environments. Rather than memorizing syntax in isolation, the goal is to understand *which command to reach for* during a real incident.
+
+<Tabs>
+  <Tab title="Process Management">
+
+    ## 1. `ps aux` — View Running Processes
+
+    `ps` displays information about running processes. The `aux` flags show processes for all users with detailed CPU and memory columns.
+
+    ```bash title="Syntax"
+    ps aux
+    ```
+
+    ```bash title="Useful variants"
+    ps -ef
+    ps aux | grep nginx
+    ps aux --sort=-%cpu
+    ps aux --sort=-%mem
+    ```
+
+    ```bash title="Example: find nginx processes"
+    ps aux | grep nginx
+    ```
+
+    ```text title="Example output"
+    root      1234  0.0  1.2  ... nginx: master process
+    www-data  1250  0.1  2.1  ... nginx: worker process
+    ```
+
+    | Column | Meaning |
+    |--------|---------|
+    | USER | User owning the process |
+    | PID | Process ID |
+    | %CPU | CPU utilization |
+    | %MEM | Memory utilization |
+    | VSZ | Virtual memory size |
+    | RSS | Resident memory size |
+    | STAT | Process state |
+    | START | Process start time |
+    | COMMAND | Command that started the process |
+
+    <Tip>
+    On a CPU-spiking EC2 instance, start with `ps aux --sort=-%cpu | head` to immediately identify the top offenders.
+    </Tip>
+
+    ```bash title="Find memory-heavy processes"
+    ps aux --sort=-%mem | head
+    ```
+
+    ---
+
+    ## 2. `top` — Real-Time Process Monitoring
+
+    `top` provides a continuously updating view of CPU, memory, load average, and running processes.
+
+    ```bash title="Launch top"
+    top
+    ```
+
+    ```text title="Example output"
+    top - 10:21:30 up 15 days, 2 users
+    %Cpu(s): 1.3 us, 0.7 sy, 0.0 ni, 97.6 id
+    MiB Mem : 3866.8 total, 1250.6 free
+    ```
+
+    | Key | Action |
+    |-----|--------|
+    | `P` | Sort by CPU |
+    | `M` | Sort by memory |
+    | `1` | Show individual CPU cores |
+    | `k` | Kill a process |
+    | `r` | Change process priority |
+    | `q` | Quit |
+
+    <Note>
+    When a Linux server suddenly becomes slow, open `top` and check: CPU utilization, load average, memory usage, and which processes are consuming the most resources. Use `htop` for a more user-friendly interface where available.
+    </Note>
+
+  </Tab>
+
+  <Tab title="Disk & Files">
+
+    ## 3. `df -h` — Check Disk Space
+
+    `df` reports available and used disk space for mounted filesystems. The `-h` flag renders values in human-readable units.
+
+    ```bash title="Check all filesystems"
+    df -h
+    ```
+
+    ```text title="Example output"
+    Filesystem      Size  Used Avail Use% Mounted on
+    /dev/xvda1       40G   15G   23G  40% /
+    /dev/xvdb       100G   92G  3.2G  97% /var
+    ```
+
+    ```bash title="Check a specific mount"
+    df -h /var
+    ```
+
+    ```bash title="Include filesystem type"
+    df -Th
+    ```
+
+    ```bash title="Check inode usage"
+    df -ih
+    ```
+
+    <Warning>
+    If disk space appears available but files still cannot be created, your server may have exhausted inodes. Always check `df -ih` as well.
+    </Warning>
+
+    ---
+
+    ## 4. `du -sh /path` — Find Directory Size
+
+    `du` estimates file and directory space usage. Use it when `df -h` tells you *that* a filesystem is full but not *what* is consuming space.
+
+    ```bash title="Check a single directory"
+    du -sh /var/log
+    ```
+
+    ```bash title="Show sizes of all items inside a directory"
+    du -sh /var/log/*
+    ```
+
+    ```bash title="Find the largest directories"
+    du -h --max-depth=1 /var | sort -hr
+    ```
+
+    | Option | Meaning |
+    |--------|---------|
+    | `-s` | Summary (one line per argument) |
+    | `-h` | Human-readable sizes |
+    | `-a` | Include individual files |
+    | `-d` | Limit directory depth |
+
+    ```text title="Example output"
+    8.5G  /var/log
+    3.2G  /var/lib
+    1.1G  /var/cache
+    ```
+
+    ---
+
+    ## 6. `ls -lah` — List Files with Details
+
+    `ls` lists files and directories. `-l` provides detailed info, `-a` includes hidden files, and `-h` makes sizes human-readable.
+
+    ```bash title="Detailed listing of /var/log"
+    ls -lah /var/log
+    ```
+
+    ```text title="Example output"
+    drwxr-xr-x  2 root root 4.0K May 20 10:10 .
+    -rw-r--r--  1 root root 1.2K May 20 10:10 messages
+    ```
+
+    ```bash title="Sort by modification time (newest last)"
+    ls -ltr
+    ```
+
+    <Tip>
+    `ls -lt` is especially useful for finding recently modified files during an incident post-mortem.
+    </Tip>
+
+    ---
+
+    ## 7. `find` — Search for Files
+
+    `find` recursively searches directories based on name, type, size, owner, permissions, and modification time.
+
+    ```bash title="Find a specific file"
+    find /var -name "error.log"
+    ```
+
+    ```bash title="Find all .log files"
+    find /var/log -name "*.log"
+    ```
+
+    ```bash title="Find files larger than 1 GB"
+    find /var -type f -size +1G
+    ```
+
+    ```bash title="Find files modified in the last 24 hours"
+    find /var/log -type f -mtime -1
+    ```
+
+    ```bash title="Find and delete temporary files"
+    find /tmp -type f -name "*.tmp" -delete
+    ```
+
+    <Note>
+    During production troubleshooting, `find` is invaluable for locating application logs, configuration files, large files, core dumps, and recently modified files.
+    </Note>
+
+    ---
+
+    ## 8. `cat` — Display File Contents
+
+    `cat` prints file contents to standard output. Best suited for small files.
+
+    ```bash title="Display a file"
+    cat /etc/hostname
+    ```
+
+    ```text title="Example output"
+    ip-10-0-0-12
+    ```
+
+    ```bash title="Show line numbers"
+    cat -n file.txt
+    ```
+
+    <Tip>
+    For very large logs, prefer `less /var/log/syslog` instead of `cat` to avoid flooding the terminal.
+    </Tip>
+
+    ---
+
+    ## 9. `less` — View Large Files Page by Page
+
+    `less` lets you inspect large files without loading everything at once.
+
+    ```bash title="Open a large log file"
+    less /var/log/syslog
+    ```
+
+    | Key | Action |
+    |-----|--------|
+    | `Space` | Next page |
+    | `b` | Previous page |
+    | `/pattern` | Search forward |
+    | `n` | Next search result |
+    | `N` | Previous search result |
+    | `g` | Jump to beginning |
+    | `G` | Jump to end |
+    | `q` | Quit |
+
+    ---
+
+    ## 16. `tar -czf` — Create Compressed Archives
+
+    `tar` packages multiple files into one archive. With `-z`, gzip compression is applied.
+
+    ```bash title="Create a compressed archive"
+    tar -czf backup.tar.gz /var/www
+    ```
+
+    | Option | Meaning |
+    |--------|---------|
+    | `-c` | Create archive |
+    | `-x` | Extract archive |
+    | `-z` | gzip compression |
+    | `-v` | Verbose output |
+    | `-f` | Archive filename |
+
+    ```bash title="Extract an archive"
+    tar -xzf backup.tar.gz
+    ```
+
+    ```bash title="Extract to a specific directory"
+    tar -xzf backup.tar.gz -C /backup/
+    ```
+
+    ```bash title="List archive contents without extracting"
+    tar -tzf backup.tar.gz
+    ```
+
+    <Tip>
+    Before a major deployment, archive the app directory: `tar -czf app-backup.tar.gz /var/www/app`
+    </Tip>
+
+  </Tab>
+
+  <Tab title="Network">
+
+    ## 5. `ss -tulpn` — Check Listening Ports
+
+    `ss` displays socket statistics. It is the modern replacement for `netstat` and is used to identify which ports are listening and which processes own them.
+
+    ```bash title="Show all listening TCP/UDP ports"
+    ss -tulpn
+    ```
+
+    ```text title="Example output"
+    Netid State  Local Address:Port  PID/Program
+    tcp   LISTEN 0.0.0.0:22          1234/sshd
+    tcp   LISTEN 0.0.0.0:80          2345/nginx
+    ```
+
+    | Option | Meaning |
+    |--------|---------|
+    | `-t` | TCP sockets |
+    | `-u` | UDP sockets |
+    | `-l` | Listening only |
+    | `-p` | Show process name/PID |
+    | `-n` | Do not resolve service names |
+
+    ```bash title="Check if a specific port is listening"
+    ss -tulpn | grep :80
+    ```
+
+    <Note>
+    If Nginx should be listening on port 80 but the application is unreachable, run `ss -tulpn | grep :80` first to confirm whether the service is actually bound.
+    </Note>
+
+    ---
+
+    ## 17. `wget` — Download Files
+
+    `wget` downloads files from HTTP, HTTPS, and other supported protocols.
+
+    ```bash title="Download a file"
+    wget https://example.com/file.zip
+    ```
+
+    ```bash title="Download with a custom filename"
+    wget -O application.zip https://example.com/file.zip
+    ```
+
+    ```bash title="Resume an interrupted download"
+    wget -c https://example.com/file.zip
+    ```
+
+    ```bash title="Download in the background"
+    wget -b https://example.com/file.zip
+    ```
+
+    ---
+
+    ## 18. `curl` — Transfer Data and Test HTTP Endpoints
+
+    `curl` is used extensively for making HTTP requests, checking API responses, and testing connectivity.
+
+    ```bash title="Check HTTP response headers"
+    curl -I https://example.com
+    ```
+
+    ```text title="Example output"
+    HTTP/1.1 200 OK
+    Server: nginx
+    Content-Type: text/html
+    ```
+
+    ```bash title="Follow redirects"
+    curl -L https://example.com
+    ```
+
+    ```bash title="POST JSON data to an API"
+    curl -X POST \
+      -H "Content-Type: application/json" \
+      -d '{"name":"devops"}' \
+      https://api.example.com/users
+    ```
+
+    ```bash title="Test a local application health endpoint"
+    curl http://localhost:8080/health
+    ```
+
+    <Tip>
+    `curl` is the fastest way to check load balancers, REST APIs, health endpoints, and reverse proxies from the command line: `curl -I https://myapplication.example.com`
+    </Tip>
+
+  </Tab>
+
+  <Tab title="System Info">
+
+    ## 19. `journalctl -xe` — Troubleshoot System Logs
+
+    `journalctl` queries logs collected by `systemd-journald`. It is the primary tool for investigating service failures on systemd-based Linux distributions.
+
+    ```bash title="View recent system logs with context"
+    journalctl -xe
+    ```
+
+    ```bash title="View logs for a specific service"
+    journalctl -u nginx
+    ```
+
+    ```bash title="View recent logs for a service"
+    journalctl -u nginx -n 100
+    ```
+
+    ```bash title="Follow logs in real time"
+    journalctl -u nginx -f
+    ```
+
+    ```bash title="View logs since one hour ago"
+    journalctl --since "1 hour ago"
+    ```
+
+    ```bash title="View logs from the current boot only"
+    journalctl -b
+    ```
+
+    <Note>
+    When a systemd service fails, combine `systemctl status nginx` with `journalctl -u nginx -xe` — together they often reveal configuration errors, missing files, or failed dependencies immediately.
+    </Note>
+
+    ---
+
+    ## 20. `uptime` — Check System Uptime and Load Average
+
+    `uptime` shows how long the system has been running, active user count, and the 1-, 5-, and 15-minute load averages.
+
+    ```bash title="Check uptime and load"
+    uptime
+    ```
+
+    ```text title="Example output"
+    10:21:30 up 15 days, 2 users, load average: 0.15, 0.10, 0.05
+    ```
+
+    A load average that significantly exceeds the number of CPU cores suggests CPU contention or processes waiting for I/O.
+
+    ```bash title="Check CPU core count"
+    nproc
+    ```
+
+    <Tip>
+    During a performance incident, run `uptime`, then `nproc`, then `top` in sequence. This immediately tells you the system load relative to available CPU capacity.
+    </Tip>
+
+    ---
+
+    ## 13. `useradd` — Create a Linux User
+
+    `useradd` creates new user accounts. Use dedicated service accounts rather than sharing root.
+
+    ```bash title="Create a user with home directory and Bash shell"
+    sudo useradd -m -s /bin/bash devops
+    ```
+
+    ```bash title="Set password"
+    sudo passwd devops
+    ```
+
+    ```bash title="Add user to a group"
+    sudo usermod -aG docker devops
+    ```
+
+    ```bash title="Verify user"
+    id devops
+    getent passwd devops
+    ```
+
+    ---
+
+    ## 14. `chmod` — Change File Permissions
+
+    `chmod` changes read, write, and execute permissions using numeric or symbolic notation.
+
+    ```text title="Permission reference"
+    r = 4    7 = rwx
+    w = 2    6 = rw-
+    x = 1    5 = r-x
+             4 = r--
+    ```
+
+    ```bash title="Common permission modes"
+    chmod 644 file.txt         # owner rw, group/others r
+    chmod 755 script.sh        # owner rwx, group/others rx
+    chmod 600 private.key      # owner rw only
+    chmod 700 private_dir      # owner rwx only
+    ```
+
+    ```bash title="Symbolic examples"
+    chmod u+x script.sh
+    chmod g+w file.txt
+    chmod o-r file.txt
+    ```
+
+    <Warning>
+    Never use `chmod 777` as a default fix. Identify the correct ownership or permission requirement and apply the minimum necessary privilege.
+    </Warning>
+
+    ---
+
+    ## 15. `chown` — Change File Owner and Group
+
+    `chown` changes the owner and/or group of files and directories.
+
+    ```bash title="Change owner and group"
+    chown ubuntu:ubuntu file.txt
+    ```
+
+    ```bash title="Recursively change ownership"
+    sudo chown -R ubuntu:ubuntu /var/www/app
+    ```
+
+    ```bash title="Change group only"
+    sudo chown :developers file.txt
+    ```
+
+    ```bash title="Verify ownership"
+    ls -l file.txt
+    ```
+
+    <Note>
+    Web application write failures are often caused by the application running as a different user than the directory owner. Fix with: `sudo chown -R www-data:www-data /var/www/html`
+    </Note>
+
+    ---
+
+    ## 10. `cp` — Copy Files and Directories
+
+    `cp` copies files or directories to a new location.
+
+    ```bash title="Back up a config file before editing"
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+    ```
+
+    ```bash title="Copy a directory recursively"
+    cp -r application/ /backup/application/
+    ```
+
+    ```bash title="Preserve permissions and timestamps"
+    cp -a application/ /backup/application/
+    ```
+
+    ---
+
+    ## 11. `mv` — Move or Rename Files
+
+    `mv` moves files and directories or renames them in-place.
+
+    ```bash title="Rename a file"
+    mv file.txt file_old.txt
+    ```
+
+    ```bash title="Archive a log file"
+    mv application.log application.log.old
+    ```
+
+    ---
+
+    ## 12. `rm` — Remove Files or Directories
+
+    `rm` removes files. With recursive flags it can delete entire directory trees.
+
+    ```bash title="Remove a single file"
+    rm file.txt
+    ```
+
+    ```bash title="Remove a directory recursively"
+    rm -rf directory
+    ```
+
+    <Warning>
+    Always verify your current path with `pwd` and the target with `ls -lah` before running `rm -rf`. A mistaken path can permanently delete critical data with no recovery.
+    </Warning>
+
+  </Tab>
+</Tabs>
+
+---
+
+## Production Troubleshooting Scenarios
+
+These commands become far more powerful when combined during real incidents. Below are five common production scenarios and the command sequences that resolve them.
+
+<Accordion title="Scenario 1 — Server Is Slow">
+```bash title="Start with uptime and process monitoring"
+uptime
+top
+ps aux --sort=-%cpu | head
+ps aux --sort=-%mem | head
+```
+
+```bash title="Then check disk"
+df -h
+du -sh /var/* | sort -hr
+```
+</Accordion>
+
+<Accordion title="Scenario 2 — Application Is Not Reachable">
+```bash title="Check process, ports, service status, and logs"
+ps aux | grep application
+ss -tulpn
+systemctl status application
+journalctl -u application -xe
+curl http://localhost:8080/health
+```
+</Accordion>
+
+<Accordion title="Scenario 3 — Disk Is Full">
+```bash title="Check filesystem and inode usage"
+df -h
+df -ih
+```
+
+```bash title="Locate large directories and files"
+du -sh /var/* | sort -hr
+find /var -type f -size +1G -ls
+du -sh /var/log/*
+```
+</Accordion>
+
+<Accordion title="Scenario 4 — Permission Denied">
+```bash title="Inspect permissions, ownership, and current user"
+ls -lah file.txt
+whoami
+id
+chmod 644 file.txt
+sudo chown user:group file.txt
+```
+</Accordion>
+
+<Accordion title="Scenario 5 — Nginx Is Not Working">
+```bash title="Check process, port, service, logs, config, and HTTP response"
+ps aux | grep nginx
+ss -tulpn | grep :80
+systemctl status nginx
+journalctl -u nginx -xe
+nginx -t
+curl -I http://localhost
+```
+</Accordion>
+
+---
+
+## Quick Reference
+
+| # | Command | Primary Use |
+|--:|---------|-------------|
+| 1 | `ps aux` | View running processes |
+| 2 | `top` | Real-time process monitoring |
+| 3 | `df -h` | Check filesystem disk usage |
+| 4 | `du -sh /path` | Check directory size |
+| 5 | `ss -tulpn` | Check listening ports |
+| 6 | `ls -lah` | List files with details |
+| 7 | `find` | Search for files/directories |
+| 8 | `cat` | Display file contents |
+| 9 | `less` | View large files page by page |
+| 10 | `cp` | Copy files/directories |
+| 11 | `mv` | Move/rename files |
+| 12 | `rm` | Remove files/directories |
+| 13 | `useradd` | Create users |
+| 14 | `chmod` | Change permissions |
+| 15 | `chown` | Change ownership |
+| 16 | `tar -czf` | Create compressed archives |
+| 17 | `wget` | Download files |
+| 18 | `curl` | Transfer/test HTTP data |
+| 19 | `journalctl -xe` | Troubleshoot systemd logs |
+| 20 | `uptime` | Check uptime and load |
+
+<Tip>
+Memorizing commands is less important than knowing which command to use during a real production problem. Use the mental model: **process problem → `ps`/`top`**, **disk problem → `df`/`du`/`find`**, **port/network problem → `ss`/`curl`**, **service problem → `systemctl`/`journalctl`**.
+</Tip>

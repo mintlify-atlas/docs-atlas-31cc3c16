@@ -1,0 +1,356 @@
+---
+title: "Kubernetes Cluster Architecture: Control Plane to Worker Nodes"
+sidebarTitle: "Cluster Architecture"
+description: "Deep-dive into kube-apiserver, etcd, scheduler, controller manager, kubelet, kube-proxy, and how Control Plane and Worker Nodes collaborate in production."
+---
+
+A Kubernetes cluster is made up of two major areas: the **Control Plane**, which acts as the brain that manages and makes decisions about the cluster, and **Worker Nodes**, which are the machines that actually run your application workloads. Understanding the responsibilities of each component — from the `kube-apiserver` acting as the API entry point, to `etcd` persisting cluster state, to the `kubelet` enforcing pod specs on individual nodes — is fundamental to operating Kubernetes in production and answering architecture questions in interviews.
+
+## The Big-Picture Mental Model
+
+At the highest level, every interaction with a Kubernetes cluster flows through this hierarchy:
+
+```text
+User / DevOps Engineer
+          ↓
+     Control Plane
+          ↓
+      Worker Nodes
+          ↓
+         Pods
+          ↓
+ Application Containers
+```
+
+The **Control Plane decides and manages** what should happen. The **Worker Nodes run and report** what is actually happening. This clean separation of concerns is why Kubernetes can self-heal, scale, and reconcile state without manual intervention.
+
+---
+
+## Request Flow: User to Running Container
+
+<Steps>
+  <Step title="User Submits a Request">
+    A DevOps engineer or CI/CD pipeline issues a command such as `kubectl apply -f deployment.yaml`. The request is sent from the user's workstation (or automation system) to the cluster's API endpoint.
+  </Step>
+  <Step title="Control Plane Receives the Request">
+    The `kube-apiserver` is the first component to handle the request. It authenticates the caller, authorizes the action, validates the resource spec, and runs it through admission controllers before accepting it.
+  </Step>
+  <Step title="State Is Written to etcd">
+    Once the request passes all checks, the API server persists the desired state to `etcd` — the cluster's single source of truth for all Kubernetes objects.
+  </Step>
+  <Step title="Controllers Reconcile Desired State">
+    The Controller Manager continuously watches the API server. When it detects a difference between desired state and actual state (e.g., 3 replicas desired, 0 running), it takes action — creating a ReplicaSet and triggering pod creation.
+  </Step>
+  <Step title="Scheduler Selects a Worker Node">
+    For each unscheduled pod, the `kube-scheduler` evaluates all available Worker Nodes against the pod's requirements (CPU, memory, taints, affinity rules) and assigns the pod to the best-fit node.
+  </Step>
+  <Step title="kubelet Enforces the Pod Spec">
+    The `kubelet` on the selected Worker Node watches for pods assigned to it. It reads the pod spec and instructs the container runtime to pull the image and start the containers.
+  </Step>
+  <Step title="Container Runtime Runs the Containers">
+    `containerd` (or another CRI-compliant runtime) creates and starts the containers inside the pod. The application is now running.
+  </Step>
+</Steps>
+
+---
+
+## Component Deep-Dives
+
+<Tabs>
+  <Tab title="Control Plane">
+
+    The Control Plane is the **"brain of the cluster"**. It runs the components that make global decisions and maintain the desired state for the entire cluster.
+
+    ### kube-apiserver
+
+    The `kube-apiserver` is the **primary API entry point** for Kubernetes. Every management operation — from `kubectl` commands to internal component communication — goes through the API server. It never directly runs containers; its job is to process API requests and coordinate access to cluster state.
+
+    **Responsibilities:**
+    - Single communication entry point for `kubectl`, controllers, the scheduler, and other Kubernetes clients
+    - Authentication — verifies *who* is making the request
+    - Authorization (RBAC) — determines *whether* they are permitted to take the action
+    - Admission control — applies policies that can reject or mutate requests
+    - Resource validation — checks that the submitted object conforms to the Kubernetes API
+    - Communication with `etcd` for all state reads and writes
+
+    ```text
+    kubectl / Client
+           ↓
+       API Server
+           ↓
+          etcd
+    ```
+
+    <Warning>
+      The API server does **not** run application containers. Application workloads run on Worker Nodes inside Pods. Confusing these two in an interview is one of the most common mistakes.
+    </Warning>
+
+    ---
+
+    ### etcd
+
+    `etcd` is a **distributed, consistent key-value store** that Kubernetes uses as its sole persistent state backend. It stores everything the Control Plane needs to know about the cluster.
+
+    **What etcd stores:**
+    - Desired state of all Kubernetes objects (Deployments, Services, ConfigMaps, Secrets, etc.)
+    - Current cluster configuration
+    - Metadata for all API resources
+    - Node registration information
+
+    <Warning>
+      `etcd` stores **Kubernetes cluster state only** — it is not the database for your application's business logic. Your app uses PostgreSQL, MySQL, DynamoDB, or similar. etcd is separate.
+    </Warning>
+
+    **Why it's critical in production:**
+
+    If `etcd` data is lost, recovering the Control Plane state becomes a severe production incident. This is why:
+
+    > **Regular etcd backups with tested restore procedures are non-negotiable in production.**
+
+    For managed Kubernetes (EKS, AKS, GKE), the cloud provider handles `etcd` availability, but you still need to understand what it does.
+
+    ---
+
+    ### kube-scheduler
+
+    The `kube-scheduler` watches for pods that have been created but not yet assigned to a node, then selects the most appropriate Worker Node for each one.
+
+    **Scheduling factors considered:**
+    - CPU and memory requests vs. node available capacity
+    - Node selectors and node affinity/anti-affinity rules
+    - Pod affinity and anti-affinity rules
+    - Taints and tolerations
+    - Topology spread constraints
+
+    ```text
+    Pod needs a node
+           ↓
+       Scheduler evaluates constraints
+           ↓
+    Selected Worker Node
+    ```
+
+    <Note>
+      The Scheduler **decides where** a pod should run. It does not start containers, pull images, or execute anything on the node. That is the kubelet's job. Keep these responsibilities separate in your mental model.
+    </Note>
+
+    ---
+
+    ### kube-controller-manager
+
+    The Controller Manager runs a set of **control loops** (controllers) that continuously watch the cluster state via the API server and act to bring the actual state in line with the desired state. This cycle is called **reconciliation**.
+
+    **Example reconciliation loop:**
+
+    ```text
+    Desired State = 5 replicas
+    Actual State  = 3 replicas
+           ↓
+    Controller detects the gap
+           ↓
+    Creates 2 new Pods
+           ↓
+    Actual State = 5 replicas ✅
+    ```
+
+    **Examples of built-in controllers:**
+    - Deployment controller — manages rollout via ReplicaSets
+    - ReplicaSet controller — ensures the correct number of pod replicas
+    - Node controller — monitors node health and handles evictions
+    - Job and CronJob controllers
+
+    > **Controller = Maintains Desired State through continuous reconciliation**
+
+    ---
+
+    ### cloud-controller-manager
+
+    When Kubernetes runs inside a cloud provider (AWS, Azure, GCP), the `cloud-controller-manager` provides integration with cloud-specific infrastructure such as load balancers, node metadata, and storage provisioning. This component is not present in on-premises or bare-metal clusters.
+
+  </Tab>
+  <Tab title="Worker Nodes">
+
+    Worker Nodes are the **"muscles of the cluster"** — they provide the compute environment where Pods and application containers actually run. Each Worker Node runs three core components.
+
+    ---
+
+    ### kubelet
+
+    The `kubelet` is the **primary node agent**. It runs on every Worker Node and is responsible for ensuring that the pods assigned to its node are running and healthy.
+
+    **Responsibilities:**
+    - Communicates with the API server to watch for pod specs assigned to its node
+    - Ensures the required containers for each pod are running
+    - Works with the container runtime via the Container Runtime Interface (CRI)
+    - Reports node status and pod status back to the Control Plane
+
+    ```text
+    Scheduler assigns Pod to Node-2
+           ↓
+    kubelet on Node-2 reads the Pod spec
+           ↓
+    kubelet instructs containerd to start containers
+           ↓
+    kubelet reports status to API server
+    ```
+
+    <Tip>
+      Remember the critical distinction: **Scheduler decides WHERE a pod runs. kubelet makes sure the pod runs THERE.** These are two separate responsibilities held by two separate components.
+    </Tip>
+
+    ---
+
+    ### Container Runtime (containerd / CRI)
+
+    The container runtime is responsible for the full lifecycle of containers on a Worker Node: pulling images, creating containers, starting them, stopping them, and removing them.
+
+    The modern standard runtime is **`containerd`**, which implements the Kubernetes **Container Runtime Interface (CRI)**.
+
+    ```text
+    kubelet
+       ↓
+    Container Runtime (containerd)
+       ↓
+    Container A    Container B
+    ```
+
+    The `kubelet` does not run containers itself — it delegates to the container runtime. Do not say "kubelet directly talks to Docker" in a modern Kubernetes context; `containerd` is the standard.
+
+    ---
+
+    ### kube-proxy
+
+    `kube-proxy` runs on every Worker Node and helps implement **Kubernetes Service networking**. It maintains network rules (using iptables or IPVS) that allow traffic targeting a Kubernetes Service to be forwarded to the correct backend pods.
+
+    ```text
+    Client
+      ↓
+    Kubernetes Service (virtual IP)
+      ↓
+    kube-proxy network rules
+      ↓
+    Backend Pod
+    ```
+
+    <Warning>
+      `kube-proxy` is **not** the complete Kubernetes networking solution. Kubernetes networking also depends on the CNI plugin (e.g., Calico, Cilium, AWS VPC CNI) for pod-to-pod communication. Do not oversimplify this in production interviews.
+    </Warning>
+
+    ---
+
+    ### Pods
+
+    A **Pod** is the smallest deployable unit in Kubernetes. Pods run on Worker Nodes and contain one or more containers that share:
+    - The same network namespace (and pod IP address)
+    - Optionally, configured volumes
+
+    ```text
+    Worker Node
+        ↓
+    Pod
+        ├── App Container
+        └── (optional) Sidecar Container
+    ```
+
+    Applications always run **inside Pods**, never directly on the Worker Node.
+
+  </Tab>
+</Tabs>
+
+---
+
+## Component Reference Table
+
+| Component | Location | Main Responsibility | Interview Keyword |
+|---|---|---|---|
+| `kube-apiserver` | Control Plane | Kubernetes API entry point | **Communication** |
+| `etcd` | Control Plane | Stores cluster state | **State** |
+| `kube-scheduler` | Control Plane | Selects node for Pods | **Scheduling** |
+| `kube-controller-manager` | Control Plane | Reconciles desired vs. actual state | **Reconciliation** |
+| `cloud-controller-manager` | Control Plane | Cloud provider integration | **Cloud Integration** |
+| `kubelet` | Worker Node | Manages Pods on the node | **Node Agent** |
+| `kube-proxy` | Worker Node | Helps implement Service networking | **Service Networking** |
+| Container Runtime | Worker Node | Creates and runs containers | **Runtime** |
+| Pod | Worker Node | Runs application workload | **Smallest Deployable Unit** |
+
+---
+
+## Production HA Setup
+
+In production, running a single Control Plane node is a significant availability risk. If that node becomes unavailable, all cluster management operations are affected — workloads may continue running, but no new pods can be scheduled and no changes can be applied.
+
+The standard production pattern uses **multiple Control Plane nodes** behind a load balancer:
+
+```text
+                   Load Balancer
+                        ↓
+            Kubernetes API Endpoint
+                        ↓
+       ┌────────────────┼────────────────┐
+       ↓                ↓                ↓
+  Control Plane 1  Control Plane 2  Control Plane 3
+  (API + etcd +    (API + etcd +    (API + etcd +
+   Scheduler +      Scheduler +      Scheduler +
+   Controllers)     Controllers)     Controllers)
+       └────────────────┼────────────────┘
+                        ↓
+              ┌─────────┴─────────┐
+              ↓                   ↓
+         Worker Node 1       Worker Node 2
+         (kubelet +           (kubelet +
+          kube-proxy +         kube-proxy +
+          containerd +         containerd +
+          Pods)                Pods)
+```
+
+**Key HA considerations:**
+
+- **Multiple API Server instances** provide a highly available API endpoint; the load balancer distributes traffic across them.
+- **Highly available etcd** — typically a 3- or 5-node etcd cluster using the Raft consensus algorithm to tolerate node failures.
+- **Scheduler and Controller Manager leader election** — only one instance actively makes decisions at a time; others are on standby. This prevents split-brain scenarios.
+- **Multiple Worker Nodes** — spread workloads across nodes so that a single node failure doesn't take down the whole application.
+
+<Tip>
+  Managed Kubernetes services (Amazon EKS, Azure AKS, Google GKE) handle the Control Plane HA infrastructure for you. Even so, you must understand these components and their responsibilities — managed services don't eliminate the need for architectural knowledge.
+</Tip>
+
+---
+
+## Interview Q&A
+
+<Accordion title="What is the role of kube-apiserver?">
+  The `kube-apiserver` is the main API entry point for Kubernetes. It handles communication between Kubernetes clients and the Control Plane, performing authentication, authorization, validation, admission control, and state interaction through `etcd`. It does not run containers.
+</Accordion>
+
+<Accordion title="What does etcd store, and why is it critical in production?">
+  `etcd` stores all Kubernetes cluster state — desired state, resource configurations, metadata, and object definitions. It is critical because Kubernetes depends entirely on it for cluster state. If etcd data is lost, recovering the Control Plane state can become a major production incident. Production environments must have appropriate etcd backup and restore procedures.
+</Accordion>
+
+<Accordion title="What does kube-scheduler do? Does it create containers?">
+  The Scheduler selects an appropriate Worker Node for pods that have not yet been scheduled. It evaluates resource requests, node selectors, affinity/anti-affinity rules, taints, and tolerations. It does **not** create containers — that is the kubelet and container runtime's responsibility. The Scheduler decides **where**; the kubelet ensures the pod **runs there**.
+</Accordion>
+
+<Accordion title="What is the reconciliation loop in the Controller Manager?">
+  A controller continuously compares desired state (stored in etcd) with actual state (observed in the cluster). When there is a difference, it takes corrective action. For example, if a Deployment specifies 5 replicas but only 3 are running, the controller creates 2 additional pods. This loop runs continuously — it's what makes Kubernetes self-healing.
+</Accordion>
+
+<Accordion title="What is the difference between kubelet and kube-proxy?">
+  **`kubelet`** is the node agent. It manages pod lifecycle on its Worker Node — ensuring containers are running, healthy, and consistent with the pod spec. **`kube-proxy`** implements Kubernetes Service networking on the node, maintaining network rules so that Service traffic reaches the correct backend pods. They have entirely different responsibilities.
+</Accordion>
+
+<Accordion title="What is the difference between Control Plane and Worker Node?">
+  The **Control Plane** makes decisions about the cluster and maintains desired state. It contains the API server, etcd, scheduler, and controller manager. The **Worker Nodes** provide the execution environment for application workloads. They run kubelet, kube-proxy, a container runtime, and the pods themselves. In short: **Control Plane manages; Worker Nodes run apps**.
+</Accordion>
+
+<Accordion title="Why do production clusters use multiple Control Plane nodes?">
+  A single Control Plane is a single point of failure. If it becomes unavailable, cluster management operations are disrupted — no scheduling, no rollouts, no configuration changes. Multiple Control Plane nodes behind a load balancer provide high availability for the API endpoint, etcd consensus, and scheduling/controller functions.
+</Accordion>
+
+<Accordion title="What are common interview mistakes about Kubernetes architecture?">
+  - Saying "etcd runs containers" — etcd stores **cluster state**, not workloads.
+  - Saying "Scheduler runs Pods" — Scheduler selects the **node**; kubelet runs the pod.
+  - Saying "kubelet chooses the node" — the **Scheduler** chooses; kubelet manages the pod on the chosen node.
+  - Saying "kube-proxy is the complete networking solution" — it only implements **Service networking**; the CNI plugin handles pod-to-pod networking.
+  - Saying "Pod = Container" — a Pod is a **wrapper** that can contain one or more containers.
+  - Saying "API Server directly runs applications" — applications run on **Worker Nodes inside Pods**.
+</Accordion>

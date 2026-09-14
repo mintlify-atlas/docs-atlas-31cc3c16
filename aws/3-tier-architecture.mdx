@@ -1,0 +1,474 @@
+---
+title: "3-Tier AWS Production Architecture: A Complete Guide"
+sidebarTitle: "3-Tier Architecture"
+description: "Deep-dive into the AWS 3-tier architecture covering presentation, application, and data tiers with Route 53, CloudFront, WAF, ALB, EC2, Aurora, and ElastiCache."
+---
+
+A 3-tier architecture separates an application into three logical layers — Presentation, Application, and Data — and this separation is one of the most important concepts in cloud architecture interviews and real production deployments. On AWS, each tier maps to a concrete set of managed services, network boundaries, and security controls. The key production insight is that "3-tier" describes a *logical* separation, not three physical servers: each tier can contain multiple services, Auto Scaling Groups, Availability Zones, and redundant components.
+
+<Note>
+**Production note:** A single EC2 instance serving both your application logic and your database is not a 3-tier architecture — it is a single point of failure. The tiers must be independently deployable, independently scalable, and separated by network controls.
+</Note>
+
+## Architecture Overview
+
+The three tiers map to distinct AWS services:
+
+| Tier | Responsibility | AWS Services |
+|---|---|---|
+| **Presentation** | User-facing frontend and edge delivery | S3, CloudFront, Route 53 |
+| **Application** | Business logic and API processing | ALB, EC2, Auto Scaling Group |
+| **Data** | Persistence, caching, and object storage | Aurora/RDS, ElastiCache (Redis), S3 |
+
+Cross-cutting concerns — WAF, IAM, KMS, CloudWatch, CloudTrail, Systems Manager — span all three tiers.
+
+## Reference Production Architecture
+
+The canonical production request flow is:
+
+```text
+Users
+   |
+   v
+Route 53
+   |
+   v
+CloudFront
+   |----------------------> S3 (Frontend static assets)
+   |
+   v
+AWS WAF
+   |
+   v
+Application Load Balancer
+   |
+   +-------------------+
+   |                   |
+   v                   v
+Private Subnet AZ-A   Private Subnet AZ-B
+   |                   |
+EC2 / App Servers     EC2 / App Servers
+   |                   |
+   +---------+---------+
+             |
+       Aurora / RDS
+             |
+       ElastiCache (Redis)
+             |
+            S3
+      (Media / Documents)
+```
+
+CloudFront can serve both static frontend assets (from S3) and dynamic API traffic (forwarded to the ALB) using path-based behaviors:
+
+```text
+/*        -> S3 (static frontend)
+/api/*    -> ALB (backend APIs)
+```
+
+---
+
+## Tier 1 — Presentation Tier
+
+The presentation tier delivers the user interface. In modern AWS deployments this means static assets (React, Angular, Vue, HTML/CSS/JS) stored in Amazon S3 and distributed globally through Amazon CloudFront.
+
+### Why CloudFront?
+
+- Caches content at edge locations worldwide, reducing latency for global users
+- Terminates TLS/HTTPS at the edge
+- Integrates directly with AWS WAF for web-layer protection
+- Reduces direct load on S3 by serving cached responses
+
+### Secure S3 Origin Pattern
+
+<Warning>
+Never make an S3 bucket publicly writable. The production-safe design keeps the bucket private and allows CloudFront to read it through Origin Access Control (OAC).
+</Warning>
+
+```text
+Internet
+   |
+CloudFront
+   |
+Origin Access Control
+   |
+S3 Private Bucket
+```
+
+### CI/CD Deployment Flow
+
+```text
+Developer → Git → CI Pipeline → Build React App
+   → Upload artifacts to S3
+   → CloudFront Cache Invalidation
+```
+
+For large deployments, prefer cache-busting with versioned asset filenames over broad invalidations to avoid unnecessary cost and delay.
+
+---
+
+## Route 53 — DNS Layer
+
+Route 53 resolves domain names and routes users to the correct AWS endpoint. In a split-domain architecture, the frontend and API can use separate DNS names:
+
+```text
+www.example.com   → Route 53 → CloudFront
+api.example.com   → Route 53 → ALB
+```
+
+**Production considerations:**
+- Use Alias records (not CNAME) for AWS resources like ALBs and CloudFront distributions
+- Configure health checks to support failover routing policies
+- Set appropriate TTLs — low TTLs allow faster failover but increase DNS query volume
+
+---
+
+## AWS WAF — Web Application Firewall
+
+WAF sits between CloudFront (or the ALB) and your application, blocking HTTP-layer attacks before they consume application compute.
+
+**Protects against:**
+- SQL injection
+- Cross-site scripting (XSS)
+- IP-based abuse
+- Bot traffic
+- Sudden request spikes from a single source (rate-based rules)
+
+<Tip>
+A rate-based WAF rule can absorb a spike of abusive traffic from a single IP before it ever reaches the ALB. This buys time during an incident and protects your Auto Scaling budget.
+</Tip>
+
+<Warning>
+WAF is not a replacement for application-level authentication, authorization, input validation, or dedicated DDoS protection (AWS Shield).
+</Warning>
+
+---
+
+## Tier 2 — Application Tier
+
+The application tier hosts your business logic — Java Spring Boot, Node.js, Python, .NET, Go, REST APIs. All application instances should run in **private subnets** so they are unreachable directly from the internet.
+
+```text
+Internet
+   |
+   v
+ALB (public subnet)
+   |
+   +------------------+
+   |                  |
+   v                  v
+EC2 AZ-A            EC2 AZ-B
+Private Subnet      Private Subnet
+```
+
+### Application Load Balancer
+
+The ALB provides HTTP/HTTPS load balancing with intelligent routing capabilities:
+
+**Health checks:**
+```text
+GET /health
+```
+If an instance fails the health check, ALB stops sending new traffic to that target automatically.
+
+**Path-based routing (microservices):**
+```text
+/api/users/*     -> User Service target group
+/api/orders/*    -> Order Service target group
+/api/payments/*  -> Payment Service target group
+```
+
+**Host-based routing:**
+```text
+api.example.com      -> API target group
+admin.example.com    -> Admin target group
+```
+
+### EC2 Auto Scaling Group
+
+Running a single EC2 instance is a single point of failure. Production systems use an ASG spanning multiple AZs:
+
+```text
+Normal traffic:   3 instances
+High traffic:     6 instances
+Low traffic:      2 instances
+```
+
+**Scaling signals** — CPU alone is not always the right metric. Consider:
+- Request count per target
+- ALB target response time
+- Custom CloudWatch metrics
+- Scheduled scaling for predictable traffic patterns
+
+### IAM Roles for EC2
+
+<Warning>
+Never store AWS access keys directly on EC2 instances. Use IAM roles attached to the instance profile.
+</Warning>
+
+```text
+EC2 Application
+       |
+       v
+IAM Role
+       |
+       +---- s3:GetObject (specific bucket/prefix only)
+       +---- cloudwatch:PutMetricData
+```
+
+Follow the principle of **least privilege** — not `AdministratorAccess`.
+
+### Stateless Application Design
+
+Keep application servers stateless so horizontal scaling works correctly:
+
+```text
+Bad:  User → EC2-A → Local session
+           (session lost if EC2-A fails)
+
+Good: EC2-A \
+      EC2-B  → Shared Redis session store
+      EC2-C /
+```
+
+---
+
+## Tier 3 — Data Tier
+
+The data tier stores all persistent application state. It must be in private subnets and accessible only from the application tier.
+
+### Amazon Aurora / RDS
+
+Structured transactional data — users, products, orders, inventory, payments — lives in Aurora or RDS.
+
+**Production configuration checklist:**
+- Multi-AZ deployment enabled
+- Automated backups with point-in-time recovery
+- Encryption at rest (KMS) and in transit (TLS)
+- Read replicas for read-heavy workloads
+- Maintenance windows scheduled outside peak hours
+- Connection limits monitored
+
+**Database port security:**
+```text
+App Security Group
+       |
+       | TCP 5432 (PostgreSQL) or TCP 3306 (MySQL)
+       v
+DB Security Group
+```
+
+The database security group allows traffic *only* from the application security group — never from `0.0.0.0/0`.
+
+### ElastiCache (Redis)
+
+Redis acts as a performance layer, not a source of truth:
+
+```text
+Application
+    |
+    +---- Cache Hit  ----> Redis → Return data
+    |
+    +---- Cache Miss ----> Aurora → Store in Redis → Return data
+```
+
+**Production considerations:**
+- Redis reduces database load for frequently read data (product catalog, session data)
+- Define TTLs carefully — stale cache entries cause subtle data consistency bugs
+- The application must degrade gracefully if Redis is unavailable (fall back to DB)
+- Cache invalidation strategy must match your update patterns
+
+### Amazon S3 for Media and Documents
+
+Do not store large files in relational database tables. Use S3 for:
+- Product images and videos
+- User-uploaded documents
+- PDF exports
+- Database backups
+
+```text
+Application
+    |
+    v
+S3
+    |
+    +--- /images/products/
+    +--- /documents/users/
+    +--- /exports/reports/
+```
+
+The relational database stores *metadata* (object key, user ID, file type, created timestamp); the file itself lives in S3.
+
+---
+
+## End-to-End Request Flow
+
+<Steps>
+  <Step title="DNS Resolution">
+    The browser queries Route 53 for `www.example.com`. Route 53 returns the CloudFront distribution endpoint.
+  </Step>
+  <Step title="CloudFront Edge">
+    The request hits the nearest CloudFront edge location. If the frontend assets are cached, they are returned immediately.
+  </Step>
+  <Step title="Static Frontend (Cache Miss)">
+    On a cache miss, CloudFront fetches the React build artifacts from the private S3 bucket via Origin Access Control.
+  </Step>
+  <Step title="API Call">
+    The browser's JavaScript calls `https://api.example.com/products`. The request flows through CloudFront/WAF and reaches the ALB.
+  </Step>
+  <Step title="Load Balancer Routes">
+    The ALB health-checks its targets and forwards the request to a healthy EC2 instance in either AZ-A or AZ-B.
+  </Step>
+  <Step title="Cache Lookup">
+    The application checks Redis for the product list. On a cache hit, the data is returned immediately without touching the database.
+  </Step>
+  <Step title="Database Query">
+    On a cache miss, the application queries Aurora, stores the result in Redis with an appropriate TTL, and returns the response.
+  </Step>
+  <Step title="Response Returns">
+    The response travels Aurora → Application → ALB → CloudFront → User.
+  </Step>
+</Steps>
+
+---
+
+## Security Group Design
+
+Security groups implement defence-in-depth across all tiers:
+
+```text
+Internet
+   |
+   v
+ALB Security Group      (Allow HTTPS 443 from Internet)
+   |
+   | Application port
+   v
+App Security Group      (Allow port from ALB SG only)
+   |
+   | Database port (5432 / 3306)
+   v
+DB Security Group       (Allow DB port from App SG only)
+```
+
+Never allow `0.0.0.0/0` to the database security group.
+
+---
+
+## Common Production Failure Scenarios
+
+<Tabs>
+  <Tab title="ALB 502">
+    **Cause:** ALB reached the target but got an invalid response.
+
+    **Check:**
+    1. Target health in the ALB target group
+    2. Is the application process running on the instance?
+    3. Is the application listening on the correct port?
+    4. Security group rules (does App SG allow traffic from ALB SG?)
+    5. Application logs for errors
+    6. ALB idle timeout vs. application keep-alive settings
+  </Tab>
+  <Tab title="ALB 503">
+    **Cause:** ALB has no healthy targets to forward traffic to.
+
+    **Check:**
+    ```text
+    ALB → Target Group → Target Health → EC2 → Application
+    ```
+    - Is the health check endpoint responding with HTTP 200?
+    - Are all instances in the ASG unhealthy simultaneously?
+    - Did a bad deployment break the health check?
+  </Tab>
+  <Tab title="Slow App">
+    **Trace the latency:**
+    ```text
+    CloudFront → ALB target response time
+              → EC2 CPU/Memory
+              → Redis hit/miss ratio
+              → Aurora query latency
+              → Slow query log
+    ```
+    Do not assume EC2 CPU is the root cause — database query plans and Redis miss storms are common culprits.
+  </Tab>
+  <Tab title="DB Overloaded">
+    **Possible causes:**
+    - Missing database indexes
+    - N+1 query patterns
+    - Too many open connections (scale-out added EC2 without connection pool tuning)
+    - Cache miss storm (Redis restart cleared cache; all traffic hit DB simultaneously)
+    - Insufficient DB instance size
+
+    Investigate the workload before resizing — a query plan fix is often more effective than a larger instance.
+  </Tab>
+</Tabs>
+
+---
+
+## Production Checklists
+
+<Accordion title="Security Checklist">
+- [ ] HTTPS enabled on ALB and CloudFront
+- [ ] TLS certificates configured (ACM)
+- [ ] WAF rules reviewed and tested
+- [ ] S3 buckets private; OAC configured for CloudFront
+- [ ] EC2 instances have no public IPs
+- [ ] Database not publicly accessible
+- [ ] Security groups follow least privilege
+- [ ] IAM roles follow least privilege (no `AdministratorAccess` on app role)
+- [ ] Secrets stored in Secrets Manager, not source code
+- [ ] Encryption at rest enabled (KMS) for RDS, S3, EBS
+- [ ] CloudTrail enabled
+- [ ] Monitoring and alarms configured
+- [ ] Inspector vulnerability scanning enabled
+- [ ] Backups configured and restore tested
+</Accordion>
+
+<Accordion title="Availability Checklist">
+- [ ] Multiple Availability Zones for EC2 and RDS
+- [ ] Auto Scaling Group with minimum 2 instances
+- [ ] ALB health checks configured correctly
+- [ ] RDS Multi-AZ enabled
+- [ ] NAT Gateway per AZ (or at least evaluated)
+- [ ] RPO and RTO defined and tested
+- [ ] Failure scenarios exercised (game day or chaos testing)
+</Accordion>
+
+<Accordion title="Performance Checklist">
+- [ ] CloudFront cache-hit ratio monitored
+- [ ] ALB target response time alarmed
+- [ ] 4xx/5xx error rates alarmed
+- [ ] Redis hit/miss ratio monitored
+- [ ] Database slow query log enabled
+- [ ] Connection pool sizing reviewed
+- [ ] Auto Scaling policies tested under load
+</Accordion>
+
+---
+
+## AWS Service Responsibility Summary
+
+| Service | Primary Role |
+|---|---|
+| Route 53 | DNS resolution and routing |
+| CloudFront | CDN and edge delivery |
+| S3 | Static assets and object storage |
+| WAF | HTTP-layer threat protection |
+| ALB | HTTP/HTTPS load balancing |
+| EC2 + ASG | Application compute and auto scaling |
+| IAM Role | AWS permissions for workloads |
+| Aurora/RDS | Relational database |
+| ElastiCache | In-memory caching |
+| CloudWatch | Metrics, logs, and alarms |
+| CloudTrail | AWS API activity auditing |
+| KMS | Encryption key management |
+| Systems Manager | Operational access and patch management |
+| Inspector | Vulnerability scanning |
+
+---
+
+## Interview Answer Template
+
+When asked *"Explain a production 3-tier architecture on AWS"*:
+
+> "I separate the application into presentation, application, and data tiers. Static frontend assets live in a private S3 bucket delivered through CloudFront with Origin Access Control, and Route 53 provides DNS. API traffic goes through CloudFront, WAF for HTTP-layer protection, then an internet-facing ALB. The ALB distributes requests across application instances in private subnets across multiple AZs, managed by an Auto Scaling Group. The application tier uses IAM roles — never hard-coded credentials — to access the data tier. Aurora handles transactional data, Redis provides caching, and S3 stores media. CloudWatch handles monitoring and alerting, CloudTrail audits all API calls, and KMS encrypts data at rest. The key production principles are multi-AZ high availability, horizontal scalability, least-privilege security, full observability, and a tested disaster recovery plan."

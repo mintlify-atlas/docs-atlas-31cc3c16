@@ -1,0 +1,454 @@
+---
+title: "What Happens When You Run kubectl apply in Production"
+sidebarTitle: "kubectl apply Workflow"
+description: "Traces kubectl apply through kube-apiserver auth, etcd writes, Deployment and ReplicaSet controllers, scheduler node selection, and async kubelet reconciliation."
+---
+
+When you run `kubectl apply -f deployment.yaml`, you are not directly creating a container anywhere — you are submitting a desired state declaration to the Kubernetes API. From that point forward, a chain of asynchronous, event-driven components works to reconcile your desired state into running containers on a Worker Node. Understanding this end-to-end flow — from `kubeconfig` lookup and API server authentication, through `etcd` persistence, controller reconciliation, scheduler placement, and finally `kubelet` and `containerd` starting the actual containers — is one of the most important concepts in Kubernetes production operations and a core interview topic.
+
+## The Sample Deployment
+
+Throughout this guide, the following deployment YAML is used as the concrete example:
+
+```yaml title="deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+```
+
+This YAML tells Kubernetes to:
+- Create a Deployment named `nginx-deployment`
+- Maintain **3 pod replicas** at all times
+- Run the `nginx:1.27` container image in each pod
+- Expose container port `80` inside each pod
+
+> **The YAML describes desired state. Kubernetes works continuously to make actual state match it.**
+
+---
+
+## End-to-End Flow
+
+<Steps>
+  <Step title="kubectl Parses the YAML and Reads kubeconfig">
+    When you execute:
+
+    ```bash
+    kubectl apply -f deployment.yaml
+    ```
+
+    `kubectl` first parses the YAML manifest to understand what resource is being submitted. It then reads its configuration file to determine which cluster to contact:
+
+    ```bash title="Default kubeconfig location"
+    ~/.kube/config
+    ```
+
+    The `kubeconfig` file contains:
+    - **Clusters** — API server endpoints
+    - **Users** — authentication credentials or token/certificate references
+    - **Contexts** — a named binding of a cluster, user, and namespace
+    - **Current context** — which context is active
+
+    Useful inspection commands:
+
+    ```bash
+    kubectl config current-context
+    kubectl config view
+    kubectl config get-contexts
+    ```
+
+    `kubectl` does **not** create the pod directly on a Worker Node. It sends the desired configuration to the API server and lets Kubernetes handle the rest.
+  </Step>
+
+  <Step title="Request Reaches kube-apiserver">
+    `kubectl` sends the API request to the **Kubernetes API Server** — the single entry point for all cluster management operations. All other Kubernetes components (controllers, scheduler, kubelet) also communicate through the API server.
+
+    ```text
+    kubectl
+       ↓
+    kube-apiserver
+       ↓
+    etcd / Controllers / Scheduler / kubelets
+    ```
+
+    <Warning>
+      Never say "`kubectl` directly talks to the kubelet." For normal Kubernetes API operations, `kubectl` communicates exclusively with the **API Server**. The kubelet is contacted by the control plane, not by `kubectl` directly.
+    </Warning>
+  </Step>
+
+  <Step title="Authentication — Who Are You?">
+    The API server's first security gate: it must determine the **identity** of the caller.
+
+    Common authentication mechanisms include:
+    - Client certificates (X.509)
+    - Bearer tokens
+    - OpenID Connect (OIDC)
+    - Cloud-provider IAM integrations (e.g., AWS IAM for EKS, Azure AD for AKS)
+
+    ```text
+    Authentication
+          ↓
+    "Who are you?"
+    ```
+
+    Authentication establishes identity. It does not yet determine what actions that identity is permitted to perform — that is authorization's job.
+  </Step>
+
+  <Step title="Authorization — Are You Allowed?">
+    After authentication, Kubernetes checks whether the authenticated identity is permitted to perform the requested action in the requested namespace.
+
+    The most common authorization mechanism is **RBAC (Role-Based Access Control)**.
+
+    For example, the operation triggered by `kubectl apply -f deployment.yaml` might be:
+
+    ```text
+    Identity: "ci-bot"
+    Action:   create/update Deployment
+    Resource: deployments
+    Namespace: production
+    ```
+
+    You can test authorization with:
+
+    ```bash
+    kubectl auth can-i create deployments
+    kubectl auth can-i create deployments -n production
+    ```
+
+    ```text
+    Authentication → Who are you?
+          ↓
+    Authorization  → Are you allowed?
+    ```
+  </Step>
+
+  <Step title="Admission Control and Validation">
+    Once authentication and authorization pass, the API server applies two more processing stages:
+
+    **Validation** checks that the submitted object is structurally correct according to the Kubernetes API schema. For example:
+
+    ```yaml
+    # Valid
+    replicas: 3
+
+    # Invalid — wrong type, would fail validation
+    replicas: "three"
+    ```
+
+    **Admission controllers** can reject, mutate, or apply additional policies to the request before it is persisted. Production admission policies often enforce:
+    - Required labels or annotations
+    - Image pull policies or registry restrictions
+    - Security context constraints
+    - Resource request and limit requirements
+    - Namespace-level policies
+
+    The complete API server processing chain is:
+
+    ```text
+    Request
+       ↓
+    Authentication
+       ↓
+    Authorization
+       ↓
+    Validation
+       ↓
+    Admission Control
+       ↓
+    Accepted Object
+    ```
+  </Step>
+
+  <Step title="Desired State Is Written to etcd">
+    Once the request passes all API server checks, Kubernetes **persists the desired state to `etcd`** — the cluster's distributed key-value store and single source of truth.
+
+    For the nginx deployment, etcd now holds:
+
+    ```text
+    Deployment: nginx-deployment
+    Desired replicas: 3
+    Image: nginx:1.27
+    ```
+
+    <Note>
+      `etcd` stores **Kubernetes cluster state only** — it is not the database for your application's business logic. Your application uses PostgreSQL, MySQL, DynamoDB, MongoDB, etc. Those are completely separate from `etcd`. This distinction frequently comes up in interviews.
+    </Note>
+
+    **Production etcd considerations:**
+    - High availability (3- or 5-node etcd cluster)
+    - Regular backups with tested restore procedures
+    - Storage performance (etcd is latency-sensitive)
+    - Secure communication and access control
+    - Monitoring for cluster health
+  </Step>
+
+  <Step title="Deployment Controller Creates a ReplicaSet">
+    After the Deployment object exists in the Kubernetes API (backed by `etcd`), the **Deployment controller** (part of the `kube-controller-manager`) detects it via its watch loop and takes action.
+
+    The Deployment controller does not create pods directly. Instead, it creates a **ReplicaSet** that describes the pod template and the desired replica count:
+
+    ```text
+    Desired State: 3 Pods
+    Actual State:  0 Pods
+          ↓
+    Deployment Controller detects the gap
+          ↓
+    Creates ReplicaSet
+    ```
+
+    The Deployment → ReplicaSet → Pod hierarchy exists for important reasons: ReplicaSets enable rolling updates. When you change an image version, the Deployment controller creates a new ReplicaSet and gradually shifts traffic, allowing zero-downtime rollouts.
+  </Step>
+
+  <Step title="ReplicaSet Controller Creates Pods">
+    The **ReplicaSet controller** watches for its ReplicaSet object and ensures the correct number of pods exist. With 3 replicas and 0 running pods, it creates 3 Pod objects in the API.
+
+    ```text
+    Deployment
+         ↓
+    ReplicaSet   ("Maintain 3 pods")
+         ↓
+    Pod 1 (Pending)
+    Pod 2 (Pending)
+    Pod 3 (Pending)
+    ```
+
+    At this point the pods exist as API objects but have no node assigned. They are in **Pending** state.
+
+    This reconciliation is the key to Kubernetes self-healing. If Pod 2 later crashes:
+
+    ```text
+    Desired = 3
+    Actual  = 2
+          ↓
+    ReplicaSet controller creates a replacement pod
+          ↓
+    Actual = 3 ✅
+    ```
+  </Step>
+
+  <Step title="Scheduler Assigns Pods to Nodes">
+    The **`kube-scheduler`** watches for pods that have no node assignment. For each unscheduled pod, it evaluates all available Worker Nodes against the pod's requirements and selects the most appropriate one.
+
+    Scheduling factors considered:
+    - CPU and memory requests vs. node available capacity
+    - Node selectors and node affinity/anti-affinity
+    - Pod affinity and anti-affinity
+    - Taints and tolerations
+    - Topology spread constraints
+
+    ```text
+    Pod (Pending — no node assigned)
+          ↓
+    Scheduler evaluates Worker Node 1, 2, 3 ...
+          ↓
+    Assigns Pod to Worker Node 2
+    ```
+
+    The Scheduler updates the pod's `spec.nodeName` field in the API. It does not start containers, pull images, or execute anything on the node — it only makes the placement decision.
+  </Step>
+
+  <Step title="kubelet Pulls the Image and Starts Containers">
+    The **`kubelet`** on the selected Worker Node continuously watches the API server for pods assigned to its node. Once it sees the newly assigned pod, it takes responsibility for making it run.
+
+    ```text
+    Scheduler assigns Pod → Worker Node 2
+          ↓
+    kubelet on Worker Node 2 reads the Pod spec
+          ↓
+    kubelet instructs containerd (via CRI) to:
+      1. Pull image: nginx:1.27
+      2. Create the container
+      3. Start the container
+          ↓
+    Pod status transitions: Pending → Running
+    ```
+
+    The `kubelet` works through the **Container Runtime Interface (CRI)** to communicate with `containerd`. It does not run containers itself — it delegates to the runtime.
+
+    ```text
+    kubelet
+       ↓
+    containerd (CRI)
+       ↓
+    nginx container running inside Pod
+    ```
+
+    After all 3 pods are started across their assigned nodes, the final state is:
+
+    ```text
+    Worker Node 1 → Pod 1 → nginx:1.27 container
+    Worker Node 2 → Pod 2 → nginx:1.27 container
+    Worker Node 3 → Pod 3 → nginx:1.27 container
+    ```
+  </Step>
+</Steps>
+
+---
+
+## The Async, Event-Driven Nature of Kubernetes
+
+<Note>
+  The flow above looks sequential in a study guide, but Kubernetes is fundamentally **asynchronous and reconciliation-based**. The API server, controllers, scheduler, and kubelet do not form one long synchronous call chain. Each component independently watches the API server and reacts to state changes. A more accurate mental model is:
+
+  ```text
+  Desired State (in etcd)
+         ↓
+  Multiple components watching via API
+         ↓
+  Each component reconciles its own piece:
+    - Controllers  → create/update objects
+    - Scheduler    → assign pods to nodes
+    - kubelet      → start/stop containers
+  ```
+
+  You declare what you want. Kubernetes figures out how to get there and keeps trying until it does.
+</Note>
+
+---
+
+## How to Verify the Deployment Progressed
+
+After running `kubectl apply -f deployment.yaml`, use these commands to verify each layer of the flow:
+
+```bash title="Check the Deployment"
+kubectl get deployment nginx-deployment
+kubectl describe deployment nginx-deployment
+```
+
+```bash title="Check the ReplicaSet"
+kubectl get rs
+```
+
+```bash title="Check Pods and their node placement"
+kubectl get pods -o wide
+```
+
+```bash title="Inspect a specific Pod"
+kubectl describe pod <pod-name>
+```
+
+```bash title="Check cluster nodes"
+kubectl get nodes
+kubectl describe node <node-name>
+```
+
+```bash title="View cluster events (essential for debugging)"
+kubectl get events --sort-by=.lastTimestamp
+```
+
+<Tip>
+  If a pod is stuck in `Pending` state, check `kubectl describe pod <pod-name>` first — the Events section will usually show why the Scheduler could not place it (e.g., insufficient CPU, taint mismatch, no nodes matching a selector). If it is stuck in `ImagePullBackOff`, the image name or registry credentials are the issue.
+</Tip>
+
+---
+
+## Debugging Flow for "My App Isn't Running"
+
+If someone says *"I ran `kubectl apply` but my application isn't running"*, check layer by layer:
+
+```bash
+kubectl get deployment          # Is the Deployment healthy?
+kubectl get rs                  # Did the ReplicaSet get created?
+kubectl get pods -o wide        # Are Pods scheduled and on which nodes?
+kubectl describe pod <name>     # What do the Pod events say?
+kubectl get events --sort-by=.lastTimestamp  # Any cluster-wide errors?
+```
+
+Common failure points at each layer:
+
+| Layer | Common Issues |
+|---|---|
+| API Server | Auth failure, admission policy rejection, invalid manifest |
+| etcd | Control-plane state problems, storage performance |
+| Scheduler | Insufficient CPU/memory, taint without toleration, node selector mismatch |
+| kubelet | Node unhealthy, image pull failure, runtime errors |
+| Container | App crash on startup, failed readiness probe |
+
+---
+
+## Complete Workflow Reference
+
+```text
+USER / DEVOPS ENGINEER
+        ↓
+kubectl apply -f deployment.yaml
+        ↓
+kubectl reads ~/.kube/config
+        ↓
+┌─────────────────────────┐
+│       API SERVER        │
+│  Authentication         │
+│  Authorization (RBAC)   │
+│  Validation             │
+│  Admission Control      │
+└──────────┬──────────────┘
+           ↓
+        etcd  (desired state persisted)
+           ↓
+     Deployment Controller
+           ↓
+       ReplicaSet Controller
+           ↓
+    Pods created (Pending)
+           ↓
+       kube-scheduler
+           ↓
+    Pod assigned to Worker Node
+           ↓
+        kubelet
+           ↓
+    containerd (CRI)
+           ↓
+    Pod Running → nginx container
+```
+
+---
+
+## Interview Q&A
+
+<Accordion title="What is the first thing kubectl does when you run kubectl apply?">
+  `kubectl` parses the YAML manifest and reads `~/.kube/config` to identify the target cluster, the API server endpoint, and the authentication credentials or configuration to use. It then constructs a Kubernetes API request and sends it to the API server. It does not directly create containers or contact the kubelet.
+</Accordion>
+
+<Accordion title="What are the stages the API server applies before persisting an object?">
+  The API server processes the request in four stages: **Authentication** (who are you?), **Authorization** (are you allowed?), **Validation** (is the object schema correct?), and **Admission Control** (do organizational/security policies permit this request, and should it be mutated?). Only after all four stages pass is the object written to `etcd`.
+</Accordion>
+
+<Accordion title="Why does a Deployment create a ReplicaSet instead of Pods directly?">
+  The Deployment → ReplicaSet → Pod hierarchy supports rolling updates. When you change the image version, the Deployment controller creates a new ReplicaSet with the updated pod template and gradually scales it up while scaling down the old ReplicaSet. This enables zero-downtime rollouts and easy rollback. The ReplicaSet is what actually enforces the desired replica count.
+</Accordion>
+
+<Accordion title="What does the Scheduler do, and what doesn't it do?">
+  The Scheduler selects a suitable Worker Node for each unscheduled pod by evaluating resource requests, node selectors, affinity/anti-affinity rules, taints, tolerations, and topology constraints. It updates the pod's `spec.nodeName` in the API. It does **not** pull images, create containers, or execute anything on the node — those are the kubelet and container runtime's responsibilities.
+</Accordion>
+
+<Accordion title="What is Kubernetes reconciliation and why does it matter?">
+  Reconciliation is the continuous process where Kubernetes controllers compare **desired state** (what you declared in YAML, stored in etcd) with **actual state** (what is currently running in the cluster) and take corrective action to close the gap. If a pod crashes, the ReplicaSet controller creates a replacement. If a node goes down, controllers reschedule its pods elsewhere. This is what makes Kubernetes self-healing.
+</Accordion>
+
+<Accordion title="What is the difference between kubectl apply and kubectl create?">
+  `kubectl create` is imperative — it creates a resource and fails if it already exists. `kubectl apply` is declarative — it creates the resource if it doesn't exist, or updates it if it does, based on the diff between the current state and the submitted manifest. `kubectl apply` is the standard approach for production and GitOps workflows because you can re-run it safely and it tracks intent.
+</Accordion>
+
+<Accordion title="Common interview mistakes about the kubectl apply workflow?">
+  - "`kubectl` directly creates the container" — `kubectl` submits desired state to the API server; the kubelet and runtime create the container later, asynchronously.
+  - "Scheduler creates the Pod" — the Scheduler selects the node; controllers create the pod object.
+  - "kubelet decides where the Pod should run" — the **Scheduler** decides; kubelet manages the pod on the assigned node.
+  - "etcd stores my application database" — etcd stores Kubernetes cluster state only.
+  - "kube-proxy handles all Kubernetes networking" — kube-proxy handles Service networking; the CNI plugin provides cluster-wide networking.
+</Accordion>

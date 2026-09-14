@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "AWS & Linux Real Production Issues",
+  "projectType": "general",
+  "projectName": "AWS & Linux Real Production Issues",
+  "projectDescription": "A hands-on knowledge base of real-world production scenarios, runbooks, and study guides covering AWS infrastructure, Kubernetes operations, Linux administration, and CI/CD pipelines.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#E8611A",
-    "light": "#F97316",
-    "dark": "#C2410C"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/manishcareertalks-commits/AWS-LINUX_Real-Production-Issues"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/manishcareertalks-commits/AWS-LINUX_Real-Production-Issues"
-    }
-  },
+  "primaryColor": "#E8611A",
+  "lightColor": "#F97316",
+  "darkColor": "#C2410C",
   "navigation": {
     "tabs": [
       {
@@ -89,5 +77,32 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Real-world AWS production incident runbooks (S3 deletion recovery, slow application triage)",
+    "Kubernetes troubleshooting SOPs (pending pods, uneven traffic, PodDisruptionBudget)",
+    "AWS architecture deep-dives (3-tier, VPC, DDoS protection, IAM)",
+    "Linux commands cheatsheet tailored for DevOps/SRE engineers",
+    "End-to-end CI/CD pipeline explanation (Jenkins, Docker, ArgoCD, ECR)",
+    "Interview preparation material for AWS/Kubernetes/Linux topics",
+    "Monolithic vs. Microservices architecture trade-off analysis",
+    "AWS region selection decision framework"
+  ],
+  "publicApiSurface": [
+    "kubectl get pods -o wide",
+    "kubectl describe pod",
+    "kubectl apply -f deployment.yaml",
+    "kubectl drain <node>",
+    "lsof +L1",
+    "ps aux",
+    "top",
+    "df -h",
+    "du -sh",
+    "dig / nslookup",
+    "AWS WAF Managed Rules",
+    "AWS Shield Standard / Advanced",
+    "AWS IAM Policy Evaluation Logic",
+    "S3 Versioning / Delete Markers",
+    "PodDisruptionBudget YAML (minAvailable / maxUnavailable)"
+  ]
 }

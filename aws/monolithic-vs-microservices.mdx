@@ -1,0 +1,386 @@
+---
+title: "Monolithic vs. Microservices Architecture on AWS"
+sidebarTitle: "Monolithic vs. Microservices"
+description: "Compare monolithic and microservices architectures on AWS — covering deployment models, scaling strategies, CI/CD patterns, trade-offs, and when to choose each approach."
+---
+
+When you build an application, one of the first fundamental decisions is how to structure and deploy its functionality. Two architectural approaches dominate the conversation: **monolithic architecture**, where the application is packaged and deployed as a single unit, and **microservices architecture**, where functionality is split into independently deployable services. The business requirements don't change between them — what changes is how you structure, scale, deploy, and operate the application. Understanding both deeply, and knowing when to choose each, separates a strong cloud architect from someone who simply defaults to "microservices are better."
+
+To make this concrete, consider an online shopping website with three product categories: Men, Women, and Kids. This example runs throughout both architectural explanations.
+
+---
+
+## Monolithic Architecture
+
+### What Is a Monolith?
+
+In a monolithic architecture, all major functionality is developed and packaged as **one deployable application unit**. For the shopping website, that means Men, Women, and Kids are all part of the same codebase. A Java build might produce:
+
+```text
+shopping-app.jar
+```
+
+or, for a web application:
+
+```text
+shopping-app.war
+```
+
+The entire application — all three product categories — is contained in a single deployable artifact.
+
+### Monolith on AWS
+
+A standard production deployment of a monolith looks like this:
+
+```text
+                    Users
+                      |
+                      v
+               Route 53 / DNS
+                      |
+                      v
+              Application Load Balancer
+                      |
+             +--------+--------+
+             v                 v
+          EC2-1              EC2-2
+       Shopping App        Shopping App
+       (Men+Women+Kids)    (Men+Women+Kids)
+             |                 |
+             +--------+--------+
+                      v
+                   Database
+```
+
+Every EC2 instance runs the *complete* shopping application. The ALB distributes traffic across healthy instances. This is intentional — you always want a minimum of two instances across two Availability Zones for production availability.
+
+### Scaling a Monolith
+
+Suppose Men traffic spikes during a seasonal sale:
+
+```text
+Men     🔥🔥🔥🔥🔥🔥🔥  (massive load)
+Women   🔥
+Kids    🔥
+```
+
+Because Men, Women, and Kids are part of the same application, adding capacity means scaling the **entire application**:
+
+```text
+             Load Balancer
+                   |
+       +-----------+-----------+
+       v           v           v
+     EC2-1       EC2-2       EC2-3
+   (Complete)  (Complete)  (Complete)
+```
+
+Each new instance carries Men, Women, and Kids — even though only Men needs the extra capacity. This is the defining scaling constraint of monolithic architecture.
+
+### Monolith CI/CD Pipeline
+
+```text
+Git
+ |
+ v
+Jenkins / GitHub Actions / GitLab CI
+ |
+ +-- Build
+ +-- Unit Tests
+ +-- Security Scan
+ +-- Package (shopping-app.jar)
+      |
+      v
+  Deploy to EC2 / Auto Scaling Group
+```
+
+A change in the Men module triggers a build and deployment of the **whole application**. All instances must be updated, even if Women and Kids were unchanged.
+
+---
+
+## Microservices Architecture
+
+### What Are Microservices?
+
+In microservices architecture, the application is split into **smaller, independently deployable services** aligned with business capabilities. Instead of one shopping application, you have:
+
+```text
+Men Service      (independent deployable unit)
+Women Service    (independent deployable unit)
+Kids Service     (independent deployable unit)
+```
+
+Each service can have its own codebase, build pipeline, deployment schedule, scaling policy, and team ownership.
+
+### Microservices on AWS
+
+A modern AWS deployment uses containers and an orchestration platform:
+
+```text
+                     Users
+                       |
+                       v
+              Route 53 / DNS
+                       |
+                       v
+              Load Balancer / API Gateway
+                       |
+          +------------+------------+
+          v            v            v
+      Men Service  Women Service  Kids Service
+          |            |            |
+          v            v            v
+      Containers    Containers    Containers
+```
+
+With Amazon EKS, the cluster manages independent pod pools per service:
+
+```text
+                 Amazon EKS Cluster
+        +------------------------------------+
+        |  Men Pods                          |
+        |  +----+ +----+ +----+             |
+        |  |Pod | |Pod | |Pod |             |
+        |  +----+ +----+ +----+             |
+        |                                    |
+        |  Women Pods                        |
+        |  +----+                            |
+        |  |Pod |                            |
+        |  +----+                            |
+        |                                    |
+        |  Kids Pods                         |
+        |  +----+                            |
+        |  |Pod |                            |
+        |  +----+                            |
+        +------------------------------------+
+```
+
+### Scaling Microservices
+
+The same sale scenario — Men traffic spikes — plays out very differently:
+
+```text
+Men Service   → scale to 10 pods    (traffic is here)
+Women Service → stay at 2 pods
+Kids Service  → stay at 1 pod
+```
+
+Only the service that needs capacity gets capacity. Women and Kids are unaffected.
+
+### Microservices CI/CD
+
+```text
+Men Code Change
+   |
+   v
+Men Pipeline
+   +-- Build
+   +-- Unit Tests
+   +-- Security Scan
+   +-- Build Container Image
+        |
+        v
+       ECR (Container Registry)
+        |
+        v
+   ECS / EKS → Men Service only
+```
+
+The Women and Kids services are **not rebuilt or redeployed**. Independent pipelines mean independent release cadences.
+
+---
+
+## Side-by-Side Comparison
+
+<Tabs>
+  <Tab title="Architecture">
+    | Dimension | Monolithic | Microservices |
+    |---|---|---|
+    | Application structure | One large application | Multiple smaller services |
+    | Deployment unit | Whole application | Individual service |
+    | Codebase | One main codebase | Multiple service codebases |
+    | Infrastructure | Often simpler | More distributed |
+    | Technology choices | Usually consistent | Services can use different stacks |
+  </Tab>
+  <Tab title="Scaling & Deployment">
+    | Dimension | Monolithic | Microservices |
+    |---|---|---|
+    | Scaling unit | Entire application | Individual service |
+    | Men traffic spikes | Scale all three categories | Scale Men Service only |
+    | Men code changes | Redeploy entire application | Deploy Men Service only |
+    | CI/CD pipelines | Often one main pipeline | Multiple independent pipelines |
+    | Deployment frequency | Lower (larger blast radius) | Higher (smaller blast radius) |
+  </Tab>
+  <Tab title="Operations">
+    | Dimension | Monolithic | Microservices |
+    |---|---|---|
+    | Operational complexity | Lower initially | Significantly higher |
+    | Failure isolation | Harder — one bad deploy affects all | Better isolation per service |
+    | Monitoring | One application dashboard | Per-service metrics required |
+    | Distributed tracing | Not needed | Required for cross-service requests |
+    | Best suited for | Small/simple apps, small teams | Large systems, independent teams |
+  </Tab>
+</Tabs>
+
+---
+
+## Real Traffic Example
+
+```text
+Men       → 1,000,000 requests/hour
+Women     →   100,000 requests/hour
+Kids      →    50,000 requests/hour
+```
+
+**Monolith scaling:**
+```text
+Shopping Application
+   → Add N instances (each has Men + Women + Kids)
+```
+Additional Women and Kids capacity is provisioned even though it's not needed.
+
+**Microservices scaling:**
+```text
+Men Service       → 10 pods/instances
+Women Service     → 2 pods/instances
+Kids Service      → 1 pod/instance
+```
+Targeted resource allocation. More efficient — but requires a container orchestration platform, service discovery, and per-service monitoring.
+
+---
+
+## DevOps Perspective
+
+<Tabs>
+  <Tab title="Monolith Ops">
+    ```text
+    Source Code
+        ↓
+    Build
+        ↓
+    Artifact (JAR / WAR / container image)
+        ↓
+    Deploy
+        ↓
+    EC2 / VM / Container
+        ↓
+    Whole Application
+    ```
+
+    The DevOps engineer manages one build system, one deployment target, and one set of infrastructure.
+  </Tab>
+  <Tab title="Microservices Ops">
+    ```text
+    Multiple Codebases / Services
+               ↓
+           CI/CD (per service)
+               ↓
+       Build Container Images
+               ↓
+           ECR Registry
+               ↓
+         ECS / EKS
+               ↓
+      Independent Service Deployments
+    ```
+
+    The DevOps engineer must manage: containers, Kubernetes/ECS, service discovery, API gateways, centralized logging (CloudWatch Logs / OpenSearch), distributed tracing (X-Ray), per-service monitoring, multiple CI/CD pipelines, secrets management per service, and inter-service network security.
+  </Tab>
+</Tabs>
+
+---
+
+## When to Choose a Monolith
+
+<CardGroup cols={2}>
+  <Card title="Small Team" icon="users">
+    A small team can move faster with a single codebase. Microservices coordination overhead is not worth it with fewer than ~5 engineers.
+  </Card>
+  <Card title="Early-Stage Product" icon="seedling">
+    Requirements change rapidly at the start. A monolith lets you refactor easily without worrying about service contracts.
+  </Card>
+  <Card title="Uniform Traffic Patterns" icon="chart-simple">
+    If Men, Women, and Kids always receive similar traffic, independent scaling provides no benefit.
+  </Card>
+  <Card title="Operational Simplicity" icon="sliders">
+    One deployment, one monitoring dashboard, one database connection pool. Sometimes that simplicity is exactly what the business needs.
+  </Card>
+</CardGroup>
+
+---
+
+## When to Consider Microservices
+
+<CardGroup cols={2}>
+  <Card title="Independent Scaling Needs" icon="arrows-up-down">
+    Different components have dramatically different traffic patterns and need to scale independently.
+  </Card>
+  <Card title="Team Autonomy" icon="building">
+    Large organizations benefit from teams owning services end-to-end — deploy, scale, and operate independently without coordinating with other teams.
+  </Card>
+  <Card title="Independent Release Cadences" icon="rocket">
+    Services evolve at different speeds. The payments service and the recommendation engine should not be coupled to the same release train.
+  </Card>
+  <Card title="Fault Isolation" icon="shield">
+    A bug in the Kids Service should not bring down the Men and Women Services. Proper microservices design contains blast radius.
+  </Card>
+</CardGroup>
+
+---
+
+## Microservices Complexity Costs
+
+Microservices are not automatically better. They introduce a substantial operational burden that a monolith avoids entirely:
+
+```text
+Monolith:  User → Application → Database
+```
+
+becomes:
+
+```text
+User
+   |
+API Gateway
+   |
+   +--------+--------+
+   v        v        v
+Men Svc  Women Svc  Kids Svc
+   |        |        |
+   v        v        v
+  Data     Data     Data
+   |
+   +---- Distributed Tracing
+   +---- Centralized Logging
+   +---- Per-Service Monitoring
+   +---- Service Discovery
+   +---- Inter-Service Auth (mTLS / IAM)
+```
+
+The additional components you must now operate include: service discovery, API gateways, container orchestration (EKS/ECS), centralized log aggregation, distributed tracing (AWS X-Ray), per-service CI/CD pipelines, inter-service authentication, and secrets management per service.
+
+<Warning>
+Organizations that adopt microservices without the operational maturity to run them end up with a **distributed monolith** — all the complexity of microservices, none of the independence benefits.
+</Warning>
+
+---
+
+## Quick Revision Table
+
+| Question | Monolithic | Microservices |
+|---|---|---|
+| How is the application structured? | One application | Multiple independent services |
+| Men traffic increases? | Scale the whole application | Scale Men Service only |
+| Men code changes? | Redeploy the entire application | Deploy Men Service only |
+| Failure in one module? | Can affect entire application | Contained to that service |
+| Operational complexity | Lower initially | Significantly higher |
+| Monitoring granularity | Application level | Per-service metrics needed |
+| Best choice? | Depends on requirements | Depends on requirements |
+
+---
+
+## Interview Answer
+
+The correct interview answer to *"Why would you choose microservices over a monolith?"* is **not** "microservices are better." A senior-level response:
+
+> "I would choose based on the application's specific requirements. Microservices are valuable when different business capabilities have meaningfully different traffic patterns that need independent scaling, when teams need independent ownership and release cadences, or when the organization has the operational maturity to run distributed systems. However, microservices introduce significant complexity — container orchestration, distributed tracing, service discovery, per-service CI/CD. For a smaller application or a smaller team, a well-designed monolith is often the right architecture. The goal is not to pick the most modern pattern — it is to choose the architecture that matches the application's scaling requirements, team structure, and operational maturity."

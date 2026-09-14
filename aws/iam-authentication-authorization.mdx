@@ -1,0 +1,445 @@
+---
+title: "AWS IAM: Authentication vs. Authorization in Production"
+sidebarTitle: "IAM Auth & AuthZ"
+description: "Master AWS IAM policy evaluation logic, debug AccessDenied errors systematically, and apply least privilege across roles, SCPs, and permission boundaries."
+---
+
+In every AWS production environment, two questions govern every single API call: *who are you?* and *what are you allowed to do?* These map to **authentication** and **authorization** — two distinct concepts that are routinely confused, yet critically different when debugging production access failures. A DevOps engineer can log in successfully (authentication passes) and still receive `AccessDenied` when trying to read an S3 object (authorization fails). Understanding exactly where in the evaluation chain a request is blocked is the fastest path to resolution — and the most common gap in cloud security posture.
+
+<Tabs>
+  <Tab title="Authentication">
+    ## What Is Authentication?
+
+    Authentication verifies the identity of a user, application, service, or workload. It answers:
+
+    > **Who are you?**
+
+    AWS confirms the identity making the request before any permissions are evaluated. If authentication fails, the request is rejected immediately with errors like:
+
+    ```text
+    InvalidClientTokenId
+    SignatureDoesNotMatch
+    ExpiredToken
+    InvalidAccessKeyId
+    ```
+
+    ### Authentication Methods in AWS
+
+    <CardGroup cols={2}>
+      <Card title="IAM User Login" icon="user">
+        Username, password, and optional MFA. Suitable for console access; avoid long-lived users for workforce access when federation is available.
+      </Card>
+      <Card title="Access Keys" icon="key">
+        Access Key ID + Secret Access Key for programmatic access. Long-lived keys are a security risk — prefer IAM roles and temporary credentials.
+      </Card>
+      <Card title="IAM Roles" icon="shield">
+        Used by EC2 instances, Lambda functions, EKS pods, CI/CD pipelines, and cross-account access. Provides temporary credentials automatically.
+      </Card>
+      <Card title="Federated Identity" icon="building">
+        Integrates AWS with identity providers such as Microsoft Entra ID, Okta, or Google Workspace via SAML or OIDC for enterprise SSO.
+      </Card>
+    </CardGroup>
+
+    ### Federated Authentication Flow
+
+    ```text
+    Employee
+       ↓
+    Corporate Identity Provider (Okta / Entra ID)
+       ↓
+    Authentication
+       ↓
+    AWS IAM Identity Center / Federation
+       ↓
+    Temporary AWS Credentials
+    ```
+
+    ### IAM Roles vs. IAM Users
+
+    | IAM Users | IAM Roles |
+    |---|---|
+    | Long-term identities | Short-term, temporary credentials |
+    | Password + access keys | No static secrets |
+    | Higher key rotation risk | Automatic credential rotation |
+    | Human console access | EC2, Lambda, EKS, CI/CD workloads |
+
+    <Tip>
+      In production, prefer IAM roles and temporary credentials over long-lived IAM user access keys for all workload and automation access.
+    </Tip>
+
+    ### Workload Authentication Patterns
+
+    Production applications must never use hardcoded credentials.
+
+    ```text
+    ❌ Bad:  Application → Hardcoded AWS Access Key
+
+    ✅ EC2:     Application → EC2 Instance Profile → IAM Role
+    ✅ Lambda:  Lambda Function → Execution Role
+    ✅ EKS:     Kubernetes Pod → OIDC / Pod Identity → IAM Role
+    ✅ CI/CD:   GitHub Actions → OIDC → IAM Role
+    ```
+
+    ### MFA in Production
+
+    Multi-Factor Authentication adds a second factor beyond passwords. Enforce MFA for:
+    - Root account access
+    - Privileged IAM users
+    - Sensitive production operations
+
+    IAM policy conditions can also require MFA before allowing specific destructive actions.
+
+    ### AWS STS Temporary Credentials
+
+    AWS Security Token Service (STS) issues temporary credentials composed of:
+    - Access Key ID
+    - Secret Access Key
+    - Session Token
+
+    Common STS operations used in production:
+
+    ```text
+    AssumeRole                 — assume an IAM role
+    AssumeRoleWithSAML         — federated access via SAML
+    AssumeRoleWithWebIdentity  — federated access via OIDC
+    ```
+
+    Temporary credentials expire after a configured duration, reducing the blast radius of any credential leak.
+  </Tab>
+
+  <Tab title="Authorization">
+    ## What Is Authorization?
+
+    Authorization determines what an authenticated identity is allowed to access or perform. It answers:
+
+    > **What are you allowed to do?**
+
+    Even after authentication succeeds, AWS evaluates multiple permission layers before allowing or denying the request. Authorization failures produce errors like:
+
+    ```text
+    AccessDenied
+    AccessDeniedException
+    UnauthorizedOperation
+    403 Forbidden
+    ```
+
+    ### IAM Policy Types
+
+    | Policy Type | Attached To | Purpose |
+    |---|---|---|
+    | Identity-based | IAM user, group, or role | Defines what the identity can do |
+    | Resource-based | S3 bucket, SQS queue, KMS key | Defines who can access the resource |
+    | Permission boundary | IAM identity | Sets the maximum permissions ceiling |
+    | SCP | AWS Organizations account | Organization-wide permission guardrails |
+    | Session policy | Temporary session | Further restricts session permissions |
+
+    ### IAM Policy Evaluation Logic
+
+    AWS follows a strict evaluation order. Every request starts as an implicit **DENY**.
+
+    ```text
+    Start
+      ↓
+    Explicit Deny anywhere?
+      ├── Yes → DENY (final)
+      └── No
+            ↓
+    Explicit Allow in applicable policy?
+      ├── Yes → ALLOW
+      └── No → Implicit DENY
+    ```
+
+    An explicit deny **always** overrides any allow — regardless of how many policies grant permission.
+
+    ```json title="Example: Explicit Deny (overrides all allows)"
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "*"
+    }
+    ```
+
+    ```json title="Example: Scoped Allow"
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": "s3:GetObject",
+          "Resource": "arn:aws:s3:::production-config-bucket/application/*"
+        }
+      ]
+    }
+    ```
+
+    ### Service Control Policies (SCPs)
+
+    SCPs apply at the AWS Organizations level and set the outer permission boundary for entire accounts.
+
+    ```text
+    Organization
+          ↓
+    SCP
+          ↓
+    AWS Account
+          ↓
+    IAM Roles and Users
+    ```
+
+    Even if an IAM role allows `s3:DeleteBucket`, an SCP denying that action results in a final `DENY`. Production troubleshooting must always check SCPs when permissions appear correctly configured.
+
+    ### Permission Boundaries
+
+    Permission boundaries cap the maximum permissions an IAM identity can receive, independent of what identity-based policies grant.
+
+    ```text
+    IAM Policy     → Allows EC2 creation
+    Permission Boundary → Does NOT include EC2 creation
+    Final Result   → DENY
+    ```
+
+    ### Least Privilege
+
+    Grant only the minimum required actions, resources, and conditions.
+
+    ```json title="Bad: Wildcard permissions"
+    {
+      "Effect": "Allow",
+      "Action": "*",
+      "Resource": "*"
+    }
+    ```
+
+    ```text title="Better: Scoped access"
+    Allow only required:
+    - Actions  (e.g., s3:GetObject only)
+    - Resources (e.g., specific bucket ARN)
+    - Conditions (e.g., MFA required, specific IP)
+    ```
+
+    <Warning>
+      Overly permissive IAM policies increase blast radius dramatically. If a role or key is compromised, an attacker inherits every permission that role holds.
+    </Warning>
+
+    ### Identity-Based vs. Resource-Based Policies
+
+    | Identity-Based Policy | Resource-Based Policy |
+    |---|---|
+    | Attached to an IAM identity | Attached to a resource |
+    | Defines what identity can do | Defines who can access resource |
+    | IAM user or role permissions | S3 bucket, SQS queue, KMS key |
+    | Common for internal permissions | Common for cross-account access |
+
+    In production both layers are evaluated simultaneously, and both must permit the action.
+  </Tab>
+</Tabs>
+
+---
+
+## End-to-End Request Flow
+
+Every AWS API request travels through a predictable evaluation pipeline. Authentication must succeed first; authorization is evaluated second across every applicable policy layer.
+
+```text
+User / Workload
+      ↓
+Authentication (Who are you?)
+      ↓
+Authenticated AWS Identity
+      ↓
+Request: e.g., GetObject from S3
+      ↓
+IAM Policy Evaluation
+      ↓
+Resource Policy Evaluation
+      ↓
+SCP / Permission Boundary Evaluation
+      ↓
+Explicit Deny?
+      ↓
+ALLOW  or  DENY
+```
+
+---
+
+## Cross-Account Access
+
+Production organizations use separate AWS accounts for development, staging, production, security, and shared services. Cross-account access flows through STS role assumption:
+
+```text
+User authenticates in Source Account
+      ↓
+sts:AssumeRole → Target Role in Production Account
+      ↓
+Receives temporary credentials (Key + Secret + Token)
+      ↓
+Authorization evaluated using target role's policies
+```
+
+The target role requires a **trust policy** that explicitly allows the source identity to assume it. Then, the assumed role's permission policies determine which actions are authorized.
+
+---
+
+## Troubleshooting `AccessDenied` Errors
+
+When an AWS access error occurs, always determine first: did authentication fail, or did authentication succeed but authorization fail? These are entirely different problems with different fixes.
+
+<Steps>
+  <Step title="Identify the Requesting Identity">
+    Determine exactly who or what is making the request:
+
+    ```text
+    IAM User / IAM Role / EC2 Instance Role /
+    Lambda Execution Role / EKS Pod Role / CI/CD Role
+    ```
+
+    Use CloudTrail or the error message context to confirm the principal ARN.
+  </Step>
+
+  <Step title="Confirm Authentication Is Valid">
+    Check whether credentials are expired, malformed, or incorrect:
+
+    ```text
+    Are credentials valid?
+    Are they expired?      (check ExpiredToken errors)
+    Is the correct role being assumed?
+    Is the session token included (for STS creds)?
+    ```
+  </Step>
+
+  <Step title="Identify the Exact Action and Resource">
+    Never troubleshoot permissions without knowing the precise action and target:
+
+    ```text
+    Action:   s3:GetObject  /  ec2:DescribeInstances  /  secretsmanager:GetSecretValue
+    Resource: Which S3 bucket ARN? Which secret? Which KMS key? Which account?
+    ```
+  </Step>
+
+  <Step title="Evaluate All Applicable IAM Policies">
+    Work through every policy layer in order:
+
+    ```text
+    ✓ Identity-based policy (IAM role / user)
+    ✓ Resource-based policy (S3 bucket policy, KMS key policy)
+    ✓ Explicit deny statements in any policy
+    ✓ Permission boundary on the identity
+    ✓ SCP on the account (via AWS Organizations)
+    ✓ Session policy (if using assumed-role session)
+    ```
+  </Step>
+
+  <Step title="Check CloudTrail for the Denied Event">
+    Query CloudTrail to get the authoritative record of what happened:
+
+    ```text
+    Who made the request?
+    Which role or identity was used?
+    Which exact action was denied?
+    Which resource was targeted?
+    Which policy caused the denial?
+    ```
+  </Step>
+
+  <Step title="Review Common Scenario-Specific Causes">
+    **EC2 app cannot access Secrets Manager:**
+    ```text
+    EC2 Role → IAM Policy → secretsmanager permission?
+    → KMS decrypt permission (if secret is encrypted)?
+    → Resource policy on the secret?
+    ```
+
+    **CI/CD pipeline gets AccessDenied:**
+    ```text
+    Is sts:AssumeRole allowed?
+    Is the trust policy on the target role correct?
+    Is there an SCP or session policy restriction?
+    ```
+
+    **EKS pod cannot access S3:**
+    ```text
+    Pod → Kubernetes Service Account → IAM Role Association correct?
+    → OIDC trust relationship configured?
+    → IAM policy on the assumed role sufficient?
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Security Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Human Access" icon="users">
+    Use Corporate IdP → IAM Identity Center → IAM Roles. Avoid shared IAM users, long-lived access keys, and root account usage for any operational task.
+  </Card>
+  <Card title="Workload Access" icon="server">
+    Use IAM Roles and OIDC federation. Never hardcode credentials in source code, container images, Git repositories, or environment variables.
+  </Card>
+  <Card title="Least Privilege" icon="lock">
+    Grant minimum required actions, specific resource ARNs, and required conditions. Review and tighten permissions regularly using IAM Access Analyzer.
+  </Card>
+  <Card title="Production Separation" icon="building-columns">
+    Use separate AWS accounts per environment, separate IAM roles, approval workflows, short-lived privileged access, and MFA for sensitive operations.
+  </Card>
+</CardGroup>
+
+---
+
+## Monitoring and Auditing
+
+Production environments must log all authentication and authorization events for security and compliance.
+
+**AWS CloudTrail** is the primary audit log. It records every AWS API call and answers:
+- Who made the request?
+- Which role was used?
+- Which action was performed?
+- Which resource was accessed?
+- When did it happen?
+
+**IAM Access Analyzer** identifies unintended public access, cross-account access, and overly permissive policies automatically.
+
+**Amazon CloudWatch** provides operational alerting on `AccessDenied` error rates, authentication failures, and abnormal API activity.
+
+<Note>
+  Enable CloudTrail in all regions and in all AWS accounts. A single missed region or account is a visibility blind spot for incident response.
+</Note>
+
+---
+
+## Interview Questions & Answers
+
+<Accordion title="What is the difference between Authentication and Authorization?">
+  Authentication verifies the identity of a user or workload — it answers *who are you?* Authorization determines what an authenticated identity is allowed to access — it answers *what are you allowed to do?* In AWS, credentials handle authentication; IAM policies, resource policies, SCPs, and permission boundaries control authorization.
+</Accordion>
+
+<Accordion title="Can Authentication succeed but Authorization fail?">
+  Yes — this is the most common source of `AccessDenied` confusion. A user logs in successfully (authentication passes), but when they attempt an action like deleting a production S3 bucket, AWS evaluates permissions and finds no allow policy (or finds an explicit deny). The result is `AccessDenied` even though the identity is completely valid.
+</Accordion>
+
+<Accordion title="Why does an IAM user get AccessDenied even though their policy allows the action?">
+  Multiple layers can override an allow:
+  - An **explicit deny** in any policy (always wins)
+  - An **SCP** at the Organizations level denying the action
+  - A **permission boundary** that doesn't include the action
+  - A **resource-based policy** that doesn't grant access
+  - Missing required **conditions** (e.g., MFA not satisfied)
+  - A **KMS key policy** restriction for encrypted resources
+  - A **session policy** restriction on the assumed-role session
+</Accordion>
+
+<Accordion title="What is the Principle of Least Privilege?">
+  Least privilege means granting only the permissions a workload or user actually needs — nothing more. Instead of `Action: "*", Resource: "*"`, you grant only the required S3 actions on the specific bucket ARN with any required conditions. This limits the blast radius if credentials are compromised and reduces the attack surface across the environment.
+</Accordion>
+
+<Accordion title="Why are IAM Roles preferred over IAM Users for production workloads?">
+  IAM roles provide temporary credentials with automatic rotation, require no hardcoded secrets, integrate natively with EC2 instance profiles, Lambda execution contexts, EKS pod identity, and CI/CD OIDC federation. Long-lived IAM user access keys create credential management overhead and elevated risk if leaked — they never expire unless manually rotated.
+</Accordion>
+
+<Accordion title="How would you troubleshoot AccessDenied in production?">
+  The systematic approach: (1) identify the requesting identity, (2) confirm credentials are valid and not expired, (3) determine the exact action and target resource, (4) check identity-based policy, resource-based policy, explicit denies, permission boundary, SCP, and session policy in that order, (5) use CloudTrail to find the denied event and identify which policy caused the denial.
+</Accordion>
+
+<Accordion title="What is the difference between a Permission Boundary and an SCP?">
+  Both limit what an IAM identity can do, but at different scopes. A **permission boundary** is attached to a specific IAM user or role and caps that identity's maximum permissions. An **SCP** is applied to an entire AWS account (or OU) via AWS Organizations and restricts all identities in that account. SCPs cannot grant permissions — they can only restrict what account-level policies allow.
+</Accordion>
