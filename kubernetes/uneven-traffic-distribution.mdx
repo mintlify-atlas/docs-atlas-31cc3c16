@@ -1,7 +1,7 @@
 ---
 title: "Only 3 of 10 Pods Receiving Traffic: SOP for Uneven Load"
 sidebarTitle: "Uneven Traffic"
-description: "Structured SOP for diagnosing uneven Kubernetes traffic distribution — covering Service selectors, readiness probes, EndpointSlices, session affinity, and Ingress config."
+description: "SOP for diagnosing uneven Kubernetes traffic distribution: Service selectors, readiness probes, EndpointSlices, session affinity, and Ingress configs."
 ---
 
 A production deployment with 10 running pods but only 3 receiving traffic is a serious reliability risk. The three active pods absorb all load — potentially 1,000 requests per second each instead of the expected 300 — while the other seven sit idle. The result is elevated CPU and memory on the active pods, increased latency, request timeouts, and reduced fault tolerance. If any of the three active pods fails, the application may go down entirely. This SOP provides a structured approach to identify exactly which layer is excluding the other pods from the traffic path and restore correct distribution.

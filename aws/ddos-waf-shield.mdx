@@ -1,7 +1,7 @@
 ---
 title: "AWS DDoS Protection: WAF, Shield, and Defense in Depth"
 sidebarTitle: "DDoS & WAF"
-description: "Learn to distinguish DDoS attacks from traffic spikes, configure WAF rules and Shield tiers, and build a layered AWS defense-in-depth protection architecture."
+description: "Learn to distinguish DDoS attacks from traffic spikes, configure WAF rules and Shield tiers, and build a layered AWS defense-in-depth architecture."
 ---
 
 When thousands of requests per second suddenly hit your AWS application, the first and most important question is not "how do I block this?" — it is "is this an attack or a legitimate spike?" Treating every high-traffic event as a DDoS attack risks blocking real users, while treating every attack as a capacity problem leads to runaway scaling costs and downstream saturation. AWS provides a layered defense-in-depth stack — Route 53, CloudFront, AWS Shield, AWS WAF, ALB, and Auto Scaling — where each component plays a distinct role. Understanding what each layer does, when it acts, and what its limits are is the foundation of a production-grade DDoS protection strategy.

@@ -1,7 +1,7 @@
 ---
 title: "3-Tier AWS Production Architecture: A Complete Guide"
 sidebarTitle: "3-Tier Architecture"
-description: "Deep-dive into the AWS 3-tier architecture covering presentation, application, and data tiers with Route 53, CloudFront, WAF, ALB, EC2, Aurora, and ElastiCache."
+description: "AWS 3-tier architecture covering presentation, application, and data tiers: Route 53, CloudFront, WAF, ALB, EC2, Aurora, and ElastiCache."
 ---
 
 A 3-tier architecture separates an application into three logical layers — Presentation, Application, and Data — and this separation is one of the most important concepts in cloud architecture interviews and real production deployments. On AWS, each tier maps to a concrete set of managed services, network boundaries, and security controls. The key production insight is that "3-tier" describes a *logical* separation, not three physical servers: each tier can contain multiple services, Auto Scaling Groups, Availability Zones, and redundant components.

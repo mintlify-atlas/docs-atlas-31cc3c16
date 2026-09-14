@@ -1,7 +1,7 @@
 ---
-title: "Kubernetes PodDisruptionBudget: Safe Node Maintenance in Production"
+title: "Kubernetes PodDisruptionBudget: Safe Node Maintenance Guide"
 sidebarTitle: "PodDisruptionBudget"
-description: "Understand PodDisruptionBudgets in Kubernetes: how they block node drains, eviction math with minAvailable, and best practices for safe production maintenance."
+description: "Learn how Kubernetes PodDisruptionBudgets block node drains, how minAvailable eviction math works, and best practices for safe production node maintenance."
 ---
 
 Planned node maintenance is a routine operation in any Kubernetes cluster — node upgrades, instance replacement, and infrastructure patching all require draining pods from nodes. But in production, draining a node without care can violate application availability requirements, briefly dropping below the minimum number of healthy replicas needed to serve traffic. The `PodDisruptionBudget` (PDB) is the Kubernetes mechanism that prevents this. It defines how many pods from a given application may be voluntarily disrupted at one time, and causes `kubectl drain` to pause or block eviction requests when the budget has been exhausted. Understanding how PDB math works is essential for anyone running or maintaining production Kubernetes clusters.

@@ -1,7 +1,7 @@
 ---
 title: "Troubleshooting Kubernetes Pods Stuck in Pending State"
 sidebarTitle: "Pod Pending"
-description: "Diagnose why Kubernetes pods stay Pending using kubectl describe, Events, and a structured decision tree covering resources, affinity, taints, storage, and CNI."
+description: "Diagnose why Kubernetes pods stay Pending using kubectl describe, Events, and a decision tree covering resources, affinity, taints, storage, and CNI."
 ---
 
 When a Kubernetes pod remains in the `Pending` state after a deployment, it almost always means the **scheduler cannot find a suitable node** to place it on — not that the application is broken. Understanding this distinction saves significant debugging time in production. A `Pending` pod has no assigned node, no running container, and no application logs to examine, so the entire investigation lives at the infrastructure and scheduling layer. This guide walks you through the eight root causes, the most important diagnostic commands, and a structured investigation workflow.

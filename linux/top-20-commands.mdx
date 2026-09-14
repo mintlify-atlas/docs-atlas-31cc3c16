@@ -180,8 +180,21 @@ Every DevOps and SRE engineer working on Linux — whether managing EC2 instance
     find /var -name "error.log"
     ```
 
+    ```text title="Example output"
+    /var/log/error.log
+    /var/www/html/error.log
+    ```
+
     ```bash title="Find all .log files"
     find /var/log -name "*.log"
+    ```
+
+    ```bash title="Case-insensitive search"
+    find /var -iname "error.log"
+    ```
+
+    ```bash title="Find directories by name"
+    find /var -type d -name "backup"
     ```
 
     ```bash title="Find files larger than 1 GB"
@@ -236,7 +249,7 @@ Every DevOps and SRE engineer working on Linux — whether managing EC2 instance
     |-----|--------|
     | `Space` | Next page |
     | `b` | Previous page |
-    | `/pattern` | Search forward |
+    | `/pattern` | Search |
     | `n` | Next search result |
     | `N` | Previous search result |
     | `g` | Jump to beginning |
@@ -468,7 +481,7 @@ Every DevOps and SRE engineer working on Linux — whether managing EC2 instance
     chmod 644 file.txt         # owner rw, group/others r
     chmod 755 script.sh        # owner rwx, group/others rx
     chmod 600 private.key      # owner rw only
-    chmod 700 private_dir      # owner rwx only
+    chmod 700 private_directory # owner rwx only
     ```
 
     ```bash title="Symbolic examples"

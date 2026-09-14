@@ -1,7 +1,7 @@
 ---
-title: "Pod Running but Unreachable: Production Troubleshooting Guide"
+title: "Pod Running but Unreachable: Kubernetes Troubleshooting"
 sidebarTitle: "Pod Not Accessible"
-description: "Debug Kubernetes pods that show Running status but are unreachable, covering service selectors, endpoints, readiness probes, NetworkPolicy, and Ingress routing."
+description: "Debug Kubernetes pods showing Running but unreachable, covering service selectors, endpoints, readiness probes, NetworkPolicy, and Ingress routing."
 ---
 
 One of the most disorienting production incidents in Kubernetes is a pod that reports `Running` but serves no traffic — users experience timeouts, 502 errors, or connection refused, while `kubectl get pods` looks perfectly healthy. The root cause is almost never the pod itself. Traffic must successfully traverse every hop in a multi-layer path before a user receives a response, and a failure at any single layer produces the same symptom: the application appears down. This guide teaches you to follow that path systematically, validate each layer, and find the break without guessing.

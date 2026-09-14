@@ -1,7 +1,7 @@
 ---
 title: "What Happens When You Run kubectl apply in Production"
 sidebarTitle: "kubectl apply Workflow"
-description: "Traces kubectl apply through kube-apiserver auth, etcd writes, Deployment and ReplicaSet controllers, scheduler node selection, and async kubelet reconciliation."
+description: "Traces kubectl apply through API server auth, etcd persistence, Deployment and ReplicaSet controllers, scheduler node selection, and async kubelet."
 ---
 
 When you run `kubectl apply -f deployment.yaml`, you are not directly creating a container anywhere — you are submitting a desired state declaration to the Kubernetes API. From that point forward, a chain of asynchronous, event-driven components works to reconcile your desired state into running containers on a Worker Node. Understanding this end-to-end flow — from `kubeconfig` lookup and API server authentication, through `etcd` persistence, controller reconciliation, scheduler placement, and finally `kubelet` and `containerd` starting the actual containers — is one of the most important concepts in Kubernetes production operations and a core interview topic.

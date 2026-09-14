@@ -1,7 +1,7 @@
 ---
 title: "Diagnosing Slow AWS Applications: Layer-by-Layer Triage"
 sidebarTitle: "Slow App Triage"
-description: "Systematic request-path triage for slow AWS applications — covering Route 53 DNS checks, ALB metrics, EC2 performance commands, database slow queries, and cache hit analysis."
+description: "Layer-by-layer AWS application triage — covers Route 53 DNS, ALB TargetResponseTime, EC2 performance commands, database slow queries, and cache analysis."
 ---
 
 When an application becomes slow in production, the instinct is to immediately restart services or scale up EC2 instances. That instinct is almost always wrong. Slowness is a symptom — the actual bottleneck could be anywhere in the request path, from a DNS misconfiguration to a missing database index to a saturated NAT Gateway. The only reliable approach is to follow the request path from the end user inward, eliminating each layer as the cause before moving to the next. This guide documents that methodology with the specific commands, metrics, and questions that let you isolate the problem quickly.

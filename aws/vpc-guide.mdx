@@ -1,7 +1,7 @@
 ---
 title: "AWS VPC Production Design: Subnets, Gateways & Security"
 sidebarTitle: "VPC Guide"
-description: "Production AWS VPC design guide covering CIDR planning, public and private subnets, Internet Gateway, NAT Gateway, route tables, security groups, NACLs, and multi-AZ layout."
+description: "Production VPC design: CIDR planning, public and private subnets, Internet Gateway, NAT Gateway, route tables, security groups, NACLs, multi-AZ layout."
 ---
 
 A Virtual Private Cloud (VPC) is the network foundation of every AWS production environment. Before you launch an EC2 instance, configure an ALB, or deploy a database, the VPC defines the IP address space, the subnet topology, the routing rules, and the network security controls that govern all traffic flows. Getting VPC design right from the start is critical — overlapping CIDR blocks, single-AZ deployments, and misconfigured route tables are among the most common and most expensive mistakes in production AWS environments.

@@ -1,7 +1,7 @@
 ---
 title: "Recovering from Accidental S3 Deletion in Production"
 sidebarTitle: "S3 Deletion Recovery"
-description: "How to recover deleted S3 objects using versioning and delete markers, investigate root cause via CloudTrail, and prevent future data loss with cross-region replication."
+description: "Recover deleted S3 objects using versioning and delete markers, audit deletions in CloudTrail, and prevent data loss with replication and IAM controls."
 ---
 
 Accidental deletion of a production S3 object is one of the most stressful incidents an engineer faces — especially when the application is already returning HTTP 404 errors and business-critical data appears gone. The good news is that if you prepared ahead of time, recovery can be a matter of minutes. This runbook walks through the full incident lifecycle: immediate containment, version-aware recovery, cross-region fallback, CloudTrail audit, and the hardened architecture that prevents a repeat.
